@@ -134,6 +134,8 @@ CREATE TABLE IF NOT EXISTS snaps(
 CREATE INDEX IF NOT EXISTS ix_snaps ON snaps(net, pool, grp, ts);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS net_errors(ts REAL, net TEXT, msg TEXT);
+CREATE TABLE IF NOT EXISTS regime(ts REAL, net TEXT, n_pools INTEGER, span_min REAL, launches_per_hour REAL,
+  med_vol_h1 REAL, med_chg_h1 REAL);
 """
 
 
@@ -144,6 +146,9 @@ def db_connect():
     c = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     c.execute("PRAGMA journal_mode=WAL")
     c.executescript(SCHEMA)
+    cols = {r[1] for r in c.execute("PRAGMA table_info(checks)")}
+    if "extra" not in cols:   # B항목 추가 전 DB 호환: 기존 데이터 유지한 채 컬럼만 추가
+        c.execute("ALTER TABLE checks ADD COLUMN extra TEXT")
     c.execute("INSERT OR IGNORE INTO meta VALUES('started_at', ?)", (str(time.time()),))
     c.commit()
     return c
@@ -175,6 +180,8 @@ def pool_metrics(p):
         "chg_h24": fnum(chg.get("h24")),
         "created_at": parse_ts(a.get("pool_created_at")),
         "name": a.get("name"),
+        # B항목: 필터 판정에는 안 쓰고 기록만 (고유 매수/매도자, 5분 흐름 등 전 구간 원자료)
+        "extra": {"tx": tx, "vol": vol, "chg": chg},
     }
 
 
@@ -268,6 +275,7 @@ def discover(db):
     for net in NETWORKS:
         if net in BAD_NETS:
             continue
+        seen = []
         for page in range(1, DISCOVERY_PAGES + 1):
             j = gt_get(f"/networks/{net}/new_pools", {"page": page, "include": "base_token"})
             if j is None:
@@ -278,6 +286,7 @@ def discover(db):
                 break
             for p in j.get("data", []):
                 m = pool_metrics(p)
+                seen.append(m)
                 tok = base_token_addr(p)
                 if not m["pool"] or not tok or not m["created_at"]:
                     continue
@@ -286,6 +295,16 @@ def discover(db):
                 cur = db.execute("INSERT OR IGNORE INTO pools(pool,net,token,name,created_at,discovered_at) VALUES(?,?,?,?,?,?)",
                                  (m["pool"], net, tok, m["name"], m["created_at"], now))
                 added += cur.rowcount
+        # B항목: 시장 분위기 — 최신 풀 N개가 몇 분에 걸쳐 생겼나(=상장 속도), 신규 풀 거래량/등락 중앙값
+        ts_list = [m["created_at"] for m in seen if m["created_at"]]
+        if len(ts_list) >= 5:
+            import statistics as st
+            span = (max(ts_list) - min(ts_list)) / 60
+            vols = [m["vol_h1"] for m in seen if m["vol_h1"] is not None]
+            chgs = [m["chg_h1"] for m in seen if m["chg_h1"] is not None]
+            db.execute("INSERT INTO regime VALUES(?,?,?,?,?,?,?)",
+                       (now, net, len(ts_list), span, len(ts_list) / (span / 60) if span > 0 else None,
+                        st.median(vols) if vols else None, st.median(chgs) if chgs else None))
     db.commit()
     log.info("discover: 신규 풀 %d개 등록", added)
 
@@ -344,10 +363,10 @@ def evaluate_due(db, max_pools=300):
                 db.execute("UPDATE pools SET done=1 WHERE net=? AND pool=?", (net, pool))
             cur = db.execute(
                 "INSERT INTO checks(net,pool,ts,age_min,price,liq,mcap,vol_h1,vol_h6,vol_h24,buys_h1,sells_h1,trades_h24,"
-                "chg_h1,chg_h24,hard_reason,chain_reason,dossier,passed) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "chg_h1,chg_h24,hard_reason,chain_reason,dossier,passed,extra) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (net, pool, now, age_min, m["price"], m["liq"], m["mcap"], m["vol_h1"], m["vol_h6"], m["vol_h24"],
                  m["buys_h1"], m["sells_h1"], m["trades_h24"], m["chg_h1"], m["chg_h24"], hard, chain_r,
-                 json.dumps(dos) if dos else None, passed))
+                 json.dumps(dos) if dos else None, passed, json.dumps(m["extra"])))
             cid = cur.lastrowid
             if passed:
                 n_pass += 1
@@ -408,6 +427,12 @@ def serve(db_path):
                 c = sqlite3.connect(db_path, timeout=30)
                 if self.path.startswith("/export.csv"):
                     body, ctype = report.export_csv(c), "text/csv; charset=utf-8"
+                elif self.path.startswith("/analyze"):
+                    import analyze
+                    from urllib.parse import parse_qs, urlparse
+                    qs = parse_qs(urlparse(self.path).query)
+                    body = analyze.run(c, float(qs.get("train", ["3"])[0]), float(qs.get("test", ["3"])[0]))
+                    ctype = "text/plain; charset=utf-8"
                 else:
                     body, ctype = report.build_report(c), "text/plain; charset=utf-8"
                 c.close()
