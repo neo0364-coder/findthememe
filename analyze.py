@@ -8,7 +8,7 @@
  - 후보마다 train 구간 분위수(하위/상위 1/3)로 컷을 정한다 → 컷 값은 test를 보지 않고 결정.
  - train에서 표본 MIN_N 이상인 후보 중 6h 순수익 중앙값 상위 2개만 test로 넘긴다.
  - test에서 '기준선(추가필터 없음)'보다 나아야, 그리고 표본 MIN_N 이상이어야 채택 후보.
- - 두 모집단을 따로 본다: pass(가이드 통과) / all(pass+대조군, 표본 많음).
+ - 세 모집단을 따로 본다: pass(가이드 통과) / pass2(수정 규칙 통과) / all(pass+대조군, 표본 많음).
 """
 import json
 import os
@@ -103,8 +103,8 @@ def run(c, train_days=3.0, test_days=3.0):
     if time.time() < t_end + H * 3600:
         L.append(f"※ test 구간 수익률이 아직 다 안 익음 — 최종 판정은 {R.kst(t_end + H * 3600)} 이후")
     names = sorted({k for r in rows for k in r["f"]})
-    for universe in ("pass", "all"):
-        U = [r for r in rows if universe == "all" or r["grp"] == "pass"]
+    for universe in ("pass", "pass2", "all"):
+        U = [r for r in rows if (r["grp"] in ("pass", "control") if universe == "all" else r["grp"] == universe)]
         tr = [r for r in U if r["ts"] < t_split]
         te = [r for r in U if t_split <= r["ts"] < t_end]
         L.append(f"\n━━ 모집단: {universe} ━━")

@@ -149,6 +149,15 @@ def db_connect():
     cols = {r[1] for r in c.execute("PRAGMA table_info(checks)")}
     if "extra" not in cols:   # B항목 추가 전 DB 호환: 기존 데이터 유지한 채 컬럼만 추가
         c.execute("ALTER TABLE checks ADD COLUMN extra TEXT")
+    if "chain_reason2" not in cols:   # pass2 추가
+        c.execute("ALTER TABLE checks ADD COLUMN chain_reason2 TEXT")
+        c.execute("ALTER TABLE checks ADD COLUMN passed2 INTEGER")
+    pcols = {r[1] for r in c.execute("PRAGMA table_info(pools)")}
+    if "guide_done" not in pcols:
+        c.execute("ALTER TABLE pools ADD COLUMN guide_done INTEGER DEFAULT 0")
+        c.execute("ALTER TABLE pools ADD COLUMN v2_done INTEGER DEFAULT 0")
+        c.execute("UPDATE pools SET guide_done=1, v2_done=1 WHERE done=1")
+    c.execute("INSERT OR IGNORE INTO meta VALUES('pass2_started_at', ?)", (str(time.time()),))
     c.execute("INSERT OR IGNORE INTO meta VALUES('started_at', ?)", (str(time.time()),))
     c.commit()
     return c
@@ -227,6 +236,66 @@ def sol_top_wallet(mint):
         return None
 
 
+# ── pass2용: 풀/프로그램 계정(PDA)을 제외한 '진짜 지갑' 최대 보유율 ──
+_P = 2 ** 255 - 19
+_D = (-121665 * pow(121666, _P - 2, _P)) % _P
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _b58decode(s):
+    n = 0
+    for ch in s:
+        n = n * 58 + _B58.index(ch)
+    b = n.to_bytes(32, "big") if n else b""
+    return b.rjust(32, b"\0")[-32:]
+
+
+def is_on_curve(addr):
+    """일반 지갑 주소는 ed25519 곡선 위, PDA(풀 금고·락업·프로그램 소유)는 곡선 밖."""
+    try:
+        b = _b58decode(addr)
+    except ValueError:
+        return True
+    y = int.from_bytes(b, "little") & ((1 << 255) - 1)
+    sign = b[31] >> 7
+    if y >= _P:
+        return False
+    u = (y * y - 1) % _P
+    v = (_D * y * y + 1) % _P
+    x = (u * pow(v, 3, _P) * pow(u * pow(v, 7, _P), (_P - 5) // 8, _P)) % _P
+    vx2 = (v * x * x) % _P
+    if vx2 == u:
+        pass
+    elif vx2 == (-u) % _P:
+        x = (x * pow(2, (_P - 1) // 4, _P)) % _P
+    else:
+        return False
+    return not (x == 0 and sign == 1)
+
+
+def sol_top_wallet_ex_pda(mint):
+    """상위 20개 토큰계정의 소유자를 조회해 PDA 소유(풀 금고 등)를 빼고, 소유자별 합산 최대 비율."""
+    def q(method, params):
+        r = requests.post(SOL_RPC, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=20)
+        return r.json()["result"]
+    try:
+        supply = float(q("getTokenSupply", [mint])["value"]["amount"])
+        top = q("getTokenLargestAccounts", [mint])["value"]
+        if not supply or not top:
+            return None
+        infos = q("getMultipleAccounts", [[t["address"] for t in top], {"encoding": "jsonParsed"}])["value"]
+        per_owner = {}
+        for t, info in zip(top, infos):
+            owner = (((info or {}).get("data") or {}).get("parsed") or {}).get("info", {}).get("owner")
+            if not owner or not is_on_curve(owner):
+                continue
+            per_owner[owner] = per_owner.get(owner, 0.0) + float(t["amount"])
+        return max(per_owner.values()) / supply if per_owner else 0.0
+    except Exception as e:
+        log.info("sol RPC(ex_pda) 실패 %s: %s", mint, e)
+        return None
+
+
 def dossier(net, token):
     j = gt_get(f"/networks/{net}/tokens/{token}/info")
     if not j:
@@ -246,6 +315,7 @@ def dossier(net, token):
     }
     if net == "solana":
         d["top_wallet_percent"] = sol_top_wallet(token)
+        d["top_wallet_ex_pda"] = sol_top_wallet_ex_pda(token)
     return d
 
 
@@ -266,6 +336,38 @@ def chain_kill(net, d):
     if net in ("bsc", "base") and d.get("is_honeypot") in (True, "true", "yes"):
         return "honeypot"
     return None
+
+
+def chain_kill_v2(net, d):
+    """pass2 규칙: (1) 값이 비면 탈락 (가이드 본문 'NEVER let null mean fine' 원칙대로)
+                    (2) Solana 최대지갑은 풀/프로그램(PDA) 계정 제외 후 계산"""
+    if net == "solana":
+        tw = d.get("top_wallet_ex_pda")
+        if tw is None:
+            return "missing_top_wallet"
+        if tw > HARD["max_top_wallet"]:
+            return "top_wallet_ex_pda"
+    if d.get("top_10_percent") is None:
+        return "missing_top_10"
+    if d["top_10_percent"] / 100 > HARD["max_top_10"]:
+        return "top_10"
+    if d.get("holder_count") is None:
+        return "missing_holders"
+    if d["holder_count"] < HARD["min_holders"]:
+        return "holders"
+    if net == "solana" and (_authority_open(d.get("mint_authority")) or _authority_open(d.get("freeze_authority"))):
+        return "authority_open"
+    if net in ("bsc", "base"):
+        hp = d.get("is_honeypot")
+        if hp is None or str(hp).lower() == "unknown":
+            return "missing_honeypot"
+        if hp in (True, "true", "yes"):
+            return "honeypot"
+    return None
+
+
+PERMANENT_GUIDE = ("honeypot", "authority_open", "top_wallet")
+PERMANENT_V2 = ("honeypot", "authority_open")
 
 
 # ───────────────────────── 루프 단계 ─────────────────────────
@@ -332,20 +434,20 @@ def next_idx_after(age_min):
 
 
 def evaluate_due(db, max_pools=300):
+    """pass(가이드 원본 규칙)와 pass2(수정 규칙)를 같은 평가 시점·같은 데이터로 동시에 판정."""
     now = time.time()
-    rows = db.execute("SELECT net,pool,token,created_at,next_idx,has_control FROM pools WHERE done=0").fetchall()
-    due = [r for r in rows if r[4] < len(CHECK_AGES_MIN) and (now - r[3]) / 60 >= CHECK_AGES_MIN[r[4]]]
+    rows = db.execute("SELECT net,pool,token,created_at,next_idx,has_control,guide_done,v2_done FROM pools WHERE done=0").fetchall()
     for r in rows:
         if r[4] >= len(CHECK_AGES_MIN) or (now - r[3]) > HARD["max_age_hours"] * 3600 + 3600:
             db.execute("UPDATE pools SET done=1 WHERE net=? AND pool=?", (r[0], r[1]))
-    due = due[:max_pools]
+    due = [r for r in rows if r[4] < len(CHECK_AGES_MIN) and (now - r[3]) / 60 >= CHECK_AGES_MIN[r[4]]][:max_pools]
     by_net = {}
     for r in due:
         by_net.setdefault(r[0], []).append(r)
-    n_pass = n_eval = 0
+    n_eval = n_pass = n_pass2 = 0
     for net, lst in by_net.items():
         metrics = fetch_multi(net, [r[1] for r in lst])
-        for (_, pool, token, created, idx, has_control) in lst:
+        for (_, pool, token, created, idx, has_control, g_done, v_done) in lst:
             age_min = (now - created) / 60
             m = metrics.get(pool)
             db.execute("UPDATE pools SET next_idx=? WHERE net=? AND pool=?", (next_idx_after(age_min), net, pool))
@@ -353,36 +455,45 @@ def evaluate_due(db, max_pools=300):
                 continue
             n_eval += 1
             hard = free_kill(m, age_min) or trade_kill(m)
-            chain_r, dos = None, None
+            chain_r = chain_r2 = dos = None
             if hard is None:
                 dos = dossier(net, token)
                 chain_r = chain_kill(net, dos) if dos else "dossier_failed"
-            passed = int(hard is None and chain_r is None)
-            if chain_r in ("honeypot", "authority_open", "top_wallet"):
-                # 가이드 bench 규칙: 바뀌지 않는 사실로 탈락 → 재평가 안 함 (API 예산 절약)
-                db.execute("UPDATE pools SET done=1 WHERE net=? AND pool=?", (net, pool))
+                chain_r2 = chain_kill_v2(net, dos) if dos else "dossier_failed"
+            passed = int(not g_done and hard is None and chain_r is None)
+            passed2 = int(not v_done and hard is None and chain_r2 is None)
+            if chain_r in PERMANENT_GUIDE:
+                g_done = 1
+            if chain_r2 in PERMANENT_V2:
+                v_done = 1
             cur = db.execute(
                 "INSERT INTO checks(net,pool,ts,age_min,price,liq,mcap,vol_h1,vol_h6,vol_h24,buys_h1,sells_h1,trades_h24,"
-                "chg_h1,chg_h24,hard_reason,chain_reason,dossier,passed,extra) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "chg_h1,chg_h24,hard_reason,chain_reason,dossier,passed,extra,chain_reason2,passed2) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (net, pool, now, age_min, m["price"], m["liq"], m["mcap"], m["vol_h1"], m["vol_h6"], m["vol_h24"],
                  m["buys_h1"], m["sells_h1"], m["trades_h24"], m["chg_h1"], m["chg_h24"], hard, chain_r,
-                 json.dumps(dos) if dos else None, passed, json.dumps(m["extra"])))
+                 json.dumps(dos) if dos else None, passed, json.dumps(m["extra"]), chain_r2, passed2))
             cid = cur.lastrowid
-            if passed:
-                n_pass += 1
-                db.execute("INSERT OR IGNORE INTO entries(net,pool,grp,ts,price,liq,check_id,next_snap) VALUES(?,?,?,?,?,?,?,?)",
-                           (net, pool, "pass", now, m["price"], m["liq"], cid, now + 900))
-                db.execute("UPDATE pools SET done=1 WHERE net=? AND pool=?", (net, pool))
-                log.info("PASS %s %s age=%.0fm liq=%.0f mcap=%.0f", net, pool, age_min, m["liq"] or 0, m["mcap"] or 0)
-            elif not has_control and age_min >= HARD["min_age_minutes"]:
-                # 대조군: 처음으로 '평가 가능 나이'에 도달했을 때 탈락한 토큰, 예산 위해 샘플링
-                db.execute("UPDATE pools SET has_control=1 WHERE net=? AND pool=?", (net, pool))
+            for grp, ok in (("pass", passed), ("pass2", passed2)):
+                if ok:
+                    db.execute("INSERT OR IGNORE INTO entries(net,pool,grp,ts,price,liq,check_id,next_snap) VALUES(?,?,?,?,?,?,?,?)",
+                               (net, pool, grp, now, m["price"], m["liq"], cid, now + 900))
+                    log.info("%s %s %s age=%.0fm liq=%.0f mcap=%.0f", grp.upper(), net, pool, age_min, m["liq"] or 0, m["mcap"] or 0)
+            n_pass += passed
+            n_pass2 += passed2
+            g_done = g_done or passed
+            v_done = v_done or passed2
+            if not passed and not has_control and age_min >= HARD["min_age_minutes"]:
+                # 대조군: 처음 '평가 가능 나이'에 가이드 규칙으로 탈락한 토큰, 예산 위해 샘플링
+                has_control = 1
                 if random.random() < CONTROL_SAMPLE:
                     db.execute("INSERT OR IGNORE INTO entries(net,pool,grp,ts,price,liq,check_id,next_snap) VALUES(?,?,?,?,?,?,?,?)",
                                (net, pool, "control", now, m["price"], m["liq"], cid, now + CONTROL_SNAP_HOURS[0] * 3600))
+            db.execute("UPDATE pools SET guide_done=?, v2_done=?, has_control=?, done=? WHERE net=? AND pool=?",
+                       (g_done, v_done, has_control, int(bool(g_done and v_done)), net, pool))
     db.commit()
     if due:
-        log.info("evaluate: %d개 평가, pass %d", n_eval, n_pass)
+        log.info("evaluate: %d개 평가, pass %d, pass2 %d", n_eval, n_pass, n_pass2)
 
 
 def snapshot_due(db):
@@ -398,7 +509,7 @@ def snapshot_due(db):
             db.execute("INSERT INTO snaps VALUES(?,?,?,?,?,?,?,?,?)",
                        (net, pool, grp, now, m["price"] if m else None, m["liq"] if m else None,
                         m["vol_h6"] if m else None, m["vol_h24"] if m else None, 0 if m else 1))
-            if grp == "pass":
+            if grp in ("pass", "pass2"):
                 nxt = now + 900
                 closed = int(nxt > ets + PASS_SNAP_HOURS * 3600 + 600)
                 db.execute("UPDATE entries SET next_snap=?, snap_idx=?, closed=? WHERE net=? AND pool=? AND grp=?",

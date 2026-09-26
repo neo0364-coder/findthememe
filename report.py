@@ -14,10 +14,10 @@ HORIZONS = [1, 6, 24]
 KST = timezone(timedelta(hours=9))
 
 # 사전 등록 합격 기준 — 테스트 시작 전에 고정. 결과를 보고 바꾸지 않는다.
-CRITERIA_TEXT = """[사전 합격 기준 — 하나라도 FAIL이면 폐기]
- C1. pass 표본 30건 이상 (6시간 수익률 측정 완료 기준)
- C2. pass 그룹 6시간 순수익률(비용 {cost:.0%} 차감) 중앙값 > 0
- C3. pass 그룹 러그 비율이 control 대비 10%p 이상 낮을 것
+CRITERIA_TEXT = """[사전 합격 기준 — pass·pass2 각각 따로 판정, 하나라도 FAIL이면 그 그룹 폐기]
+ C1. 그룹 표본 30건 이상 (6시간 수익률 측정 완료 기준)
+ C2. 그룹 6시간 순수익률(비용 {cost:.0%} 차감) 중앙값 > 0
+ C3. 그룹 러그 비율이 control 대비 10%p 이상 낮을 것
  C4. 가이드 청산규칙(거래량 비율<0.2 또는 24h) 시뮬레이션 평균 순수익률 > 0, 그리고 부트스트랩 95% 하한 > -5%
 """.format(cost=COST)
 
@@ -117,7 +117,10 @@ def build_report(c):
     L.append("[퍼널: 평가 건수와 탈락 사유]")
     tot = c.execute("SELECT COUNT(*), SUM(passed) FROM checks").fetchone()
     L.append(f" 평가 {tot[0] or 0}건, 통과 {tot[1] or 0}건, 등록 풀 {c.execute('SELECT COUNT(*) FROM pools').fetchone()[0]}개")
-    for col in ("hard_reason", "chain_reason"):
+    t2 = c.execute("SELECT SUM(passed2) FROM checks").fetchone()[0] or 0
+    p2s = c.execute("SELECT v FROM meta WHERE k='pass2_started_at'").fetchone()
+    L.append(f" pass2(수정 규칙) 통과 {t2}건" + (f" — pass2 기록 시작 {kst(float(p2s[0]))}" if p2s else ""))
+    for col in ("hard_reason", "chain_reason", "chain_reason2"):
         rows = c.execute(f"SELECT {col}, COUNT(*) FROM checks WHERE {col} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC").fetchall()
         L.append(f" {col}: " + ", ".join(f"{r}={n}" for r, n in rows))
     for ts, net, msg in c.execute("SELECT * FROM net_errors ORDER BY ts DESC LIMIT 5"):
@@ -126,6 +129,7 @@ def build_report(c):
 
     groups = {
         "pass (가이드 필터 통과)": [e for e in E if e["grp"] == "pass"],
+        "pass2 (수정 규칙: 빈값=탈락, 풀계정 제외)": [e for e in E if e["grp"] == "pass2"],
         "control (탈락 대조군)": [e for e in E if e["grp"] == "control"],
         "  └ 하드통과·top_wallet만 탈락": [e for e in E if e["grp"] == "control" and e["chain"] == "top_wallet"],
     }
@@ -148,57 +152,60 @@ def build_report(c):
         L.append(f" {name}: " + (f"{rug[name]:.1%} ({sum(flags)}/{len(flags)})" if flags else "데이터 없음"))
     L.append("")
 
-    L.append("[가이드 청산규칙 시뮬레이션 — pass 그룹, 순수익(비용 차감)]")
-    P = groups["pass (가이드 필터 통과)"]
     sims = {}
-    for label, stop in (("가이드 규칙 그대로", None), ("+ 손절 -30% 추가", 0.30)):
-        rs = [x for x in (exit_sim(e, stop) for e in P) if x]
-        net = [r - COST for r, _ in rs]
-        sims[label] = net
-        if net:
-            ci = boot_ci(net)
-            L.append(f" {label}: n={len(net)} 평균 {st.mean(net):+.1%} 중앙 {st.median(net):+.1%} "
-                     f"승률 {sum(1 for x in net if x > 0)/len(net):.1%}" + (f" 95%CI[{ci[0]:+.1%},{ci[1]:+.1%}]" if ci else ""))
-        else:
-            L.append(f" {label}: 24h 완료 표본 없음")
-    # 한 번에 한 포지션 (가이드 book.py 방식)
-    seq, busy_until = [], 0
-    for e in sorted(P, key=lambda e: e["ts"]):
-        if e["ts"] < busy_until:
-            continue
-        x = exit_sim(e)
-        if not x:
-            continue
-        seq.append(x[0] - COST)
-        busy_until = x[1]
-    if seq:
-        eq = 1.0
-        for r in seq:
-            eq *= 1 + 0.06 * r   # 가이드 SIZE: 자금의 6%
-        L.append(f" 1포지션 순차운영(자금 6%/회): {len(seq)}회, 누적 자산 {eq - 1:+.2%}")
-    L.append("")
+    for gname in ("pass (가이드 필터 통과)", "pass2 (수정 규칙: 빈값=탈락, 풀계정 제외)"):
+        P = groups[gname]
+        L.append(f"[가이드 청산규칙 시뮬레이션 — {gname}, 순수익(비용 차감)]")
+        for label, stop in (("가이드 규칙 그대로", None), ("+ 손절 -30% 추가", 0.30)):
+            rs = [x for x in (exit_sim(e, stop) for e in P) if x]
+            net = [r - COST for r, _ in rs]
+            sims[(gname, label)] = net
+            if net:
+                ci = boot_ci(net)
+                L.append(f" {label}: n={len(net)} 평균 {st.mean(net):+.1%} 중앙 {st.median(net):+.1%} "
+                         f"승률 {sum(1 for x in net if x > 0)/len(net):.1%}" + (f" 95%CI[{ci[0]:+.1%},{ci[1]:+.1%}]" if ci else ""))
+            else:
+                L.append(f" {label}: 24h 완료 표본 없음")
+        seq, busy_until = [], 0
+        for e in sorted(P, key=lambda e: e["ts"]):
+            if e["ts"] < busy_until:
+                continue
+            x = exit_sim(e)
+            if not x:
+                continue
+            seq.append(x[0] - COST)
+            busy_until = x[1]
+        if seq:
+            eq = 1.0
+            for r in seq:
+                eq *= 1 + 0.06 * r   # 가이드 SIZE: 자금의 6%
+            L.append(f" 1포지션 순차운영(자금 6%/회): {len(seq)}회, 누적 자산 {eq - 1:+.2%}")
+        L.append("")
 
-    L.append("[체인별 pass 6h gross]")
+    L.append("[체인별 6h gross]")
     for net in sorted({e["net"] for e in E}):
-        xs = [r for r in (at_horizon(e, 6) for e in P if e["net"] == net) if r is not None]
-        cx = [r for r in (at_horizon(e, 6) for e in E if e["grp"] == "control" and e["net"] == net) if r is not None]
-        L.append(f" {net:10s} pass {summ(xs)}\n {'':10s} ctrl {summ(cx)}")
+        for g, lab in (("pass", "pass "), ("pass2", "pass2"), ("control", "ctrl ")):
+            xs = [r for r in (at_horizon(e, 6) for e in E if e["grp"] == g and e["net"] == net) if r is not None]
+            L.append(f" {net if g == 'pass' else '':10s} {lab} {summ(xs)}")
     L.append("")
 
     # 판정
     L.append(CRITERIA_TEXT)
-    p6 = res6.get("pass (가이드 필터 통과)", [])
-    c1 = len(p6) >= 30
-    c2 = bool(p6) and st.median([x - COST for x in p6]) > 0
-    rp, rc = rug.get("pass (가이드 필터 통과)"), rug.get("control (탈락 대조군)")
-    c3 = rp is not None and rc is not None and (rc - rp) >= 0.10
-    g = sims.get("가이드 규칙 그대로") or []
-    ci = boot_ci(g) if g else None
-    c4 = bool(g) and st.mean(g) > 0 and ci is not None and ci[0] > -0.05
-    for k, v in (("C1", c1), ("C2", c2), ("C3", c3), ("C4", c4)):
-        L.append(f" {k}: {'PASS' if v else ('FAIL' if c1 else '판정보류(표본부족)')}")
-    L.append(" → 종합: " + ("전부 PASS — 다음 단계(소액 실전) 검토 가능" if all((c1, c2, c3, c4))
-                          else ("표본 수집 중" if not c1 else "기준 미달 — 폐기")))
+    rc = rug.get("control (탈락 대조군)")
+    for gname in ("pass (가이드 필터 통과)", "pass2 (수정 규칙: 빈값=탈락, 풀계정 제외)"):
+        p6 = res6.get(gname, [])
+        c1 = len(p6) >= 30
+        c2 = bool(p6) and st.median([x - COST for x in p6]) > 0
+        rp = rug.get(gname)
+        c3 = rp is not None and rc is not None and (rc - rp) >= 0.10
+        g = sims.get((gname, "가이드 규칙 그대로")) or []
+        ci = boot_ci(g) if g else None
+        c4 = bool(g) and st.mean(g) > 0 and ci is not None and ci[0] > -0.05
+        L.append(f" ▶ {gname}")
+        L.append("   " + "  ".join(f"{k}: {'PASS' if v else ('FAIL' if c1 else '보류')}"
+                                  for k, v in (("C1", c1), ("C2", c2), ("C3", c3), ("C4", c4))))
+        L.append("   → 종합: " + ("전부 PASS — 다음 단계(소액 실전) 검토 가능" if all((c1, c2, c3, c4))
+                               else ("표본 수집 중" if not c1 else "기준 미달 — 폐기")))
     return "\n".join(L)
 
 
@@ -209,7 +216,7 @@ def export_csv(c):
     w.writerow(["net", "pool", "grp", "entry_kst", "age_min", "mcap", "hard_reason", "chain_reason",
                 "ret_1h", "ret_6h", "ret_24h", "rug", "exit_rule_ret"])
     for e in E:
-        x = exit_sim(e) if e["grp"] == "pass" else None
+        x = exit_sim(e) if e["grp"] in ("pass", "pass2") else None
         w.writerow([e["net"], e["pool"], e["grp"], kst(e["ts"]), round(e["age"] or 0, 1), e["mcap"], e["hard"], e["chain"],
                     *[at_horizon(e, h) for h in HORIZONS], is_rug(e), x[0] if x else None])
     return buf.getvalue()
