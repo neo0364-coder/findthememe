@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
-VERSION = "v6-adaptive-rate (2026-09-27)"   # 배포 확인용: 시작 로그·리포트 첫 줄에 표시
+VERSION = "v7-sol-holders (2026-09-27)"   # 배포 확인용: 시작 로그·리포트 첫 줄에 표시
 
 # ───────────────────────── 설정 ─────────────────────────
 DB_PATH = os.environ.get("DB_PATH", "/data/memefwd.db")
@@ -450,6 +450,52 @@ def trade_flow(net, pool):
     }
 
 
+def _sol_rpc(method, params, tries=3):
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.post(SOL_RPC, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=20)
+            j = r.json()
+            if "result" in j:
+                return j["result"]
+            last = f"HTTP {r.status_code} {str(j.get('error'))[:160]}"
+        except Exception as e:
+            last = f"{type(e).__name__}: {str(e)[:160]}"
+        time.sleep(1.5 * (i + 1))
+    raise RuntimeError(f"{method} 실패: {last}")
+
+
+def sol_holders(mint):
+    """Solana 보유 구조를 한 번에: RPC 3회(공급량·상위20계정·소유자) + 실패 시 재시도.
+    top_wallet_percent: 가이드 원본(가장 큰 토큰계정 그대로)
+    top_wallet_ex_pda / top10_ex_pda: 풀 금고·프로그램 소유(PDA) 계정을 빼고 소유자별 합산"""
+    try:
+        supply = float(_sol_rpc("getTokenSupply", [mint])["value"]["amount"])
+        top = _sol_rpc("getTokenLargestAccounts", [mint])["value"]
+        if not supply or not top:
+            return {"sol_rpc_error": "empty"}
+        out = {"top_wallet_percent": float(top[0]["amount"]) / supply}
+        infos = _sol_rpc("getMultipleAccounts", [[t["address"] for t in top], {"encoding": "jsonParsed"}])["value"]
+        per_owner, pda_amt = {}, 0.0
+        for t, info in zip(top, infos):
+            owner = (((info or {}).get("data") or {}).get("parsed") or {}).get("info", {}).get("owner")
+            amt = float(t["amount"])
+            if not owner or not is_on_curve(owner):
+                pda_amt += amt
+                continue
+            per_owner[owner] = per_owner.get(owner, 0.0) + amt
+        vals = sorted(per_owner.values(), reverse=True)
+        out.update({
+            "top_wallet_ex_pda": (vals[0] / supply) if vals else 0.0,
+            "top10_ex_pda": sum(vals[:10]) / supply,
+            "pda_share_top20": pda_amt / supply,          # 상위20 중 풀·프로그램이 가진 비율 (참고)
+        })
+        return out
+    except Exception as e:
+        log.warning("sol RPC 실패 %s: %s", mint, e)
+        return {"sol_rpc_error": str(e)[:200]}
+
+
 def dossier(net, token, pool=None):
     j = gt_get(f"/networks/{net}/tokens/{token}/info")
     if not j:
@@ -468,8 +514,7 @@ def dossier(net, token, pool=None):
         "twitter_handle": a.get("twitter_handle"),
     }
     if net == "solana":
-        d["top_wallet_percent"] = sol_top_wallet(token)
-        d["top_wallet_ex_pda"] = sol_top_wallet_ex_pda(token)
+        d.update(sol_holders(token))
     elif pool:
         d.update(evm_lp_burn(net, pool))
         d.update(goplus(net, token))
@@ -507,9 +552,14 @@ def chain_kill_v2(net, d):
             return "missing_top_wallet"
         if tw > HARD["max_top_wallet"]:
             return "top_wallet_ex_pda"
-    if d.get("top_10_percent") is None:
+        t10 = d.get("top10_ex_pda")        # GT top10은 풀 금고를 포함해 신규 토큰이 거의 다 걸림 → RPC로 직접 계산
+        if t10 is None:
+            return "missing_top_10"
+        if t10 > HARD["max_top_10"]:
+            return "top_10_ex_pda"
+    elif d.get("top_10_percent") is None:
         return "missing_top_10"
-    if d["top_10_percent"] / 100 > HARD["max_top_10"]:
+    if net != "solana" and d["top_10_percent"] / 100 > HARD["max_top_10"]:
         return "top_10"
     if d.get("holder_count") is None:
         return "missing_holders"

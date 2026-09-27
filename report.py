@@ -209,7 +209,7 @@ def build_report(c):
     else:
         L.append(" 러그 표본 없음")
     L.append("[살아남은 뒤 진입 시뮬레이션 — 통과 후 N시간 기다려 러그 안 났으면 그때 진입, 6h 보유, 비용 차감]")
-    for wait in (1, 2, 3, 6):
+    for wait in (1, 2, 3, 6, 12):
         outs = [delayed_entry(e, wait, 6) for e in PP]
         av = sum(1 for o in outs if o[0] == "avoided")
         rs = [o[1] - COST for o in outs if o[0] == "entered"]
