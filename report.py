@@ -1,6 +1,7 @@
 """리포트: pass vs control 비교 + 사전 합격기준 판정. `python report.py [db경로]` 로도 실행 가능."""
 import csv
 import io
+import json
 import os
 import random
 import sqlite3
@@ -27,16 +28,18 @@ def kst(ts):
 
 
 def load(c):
-    ents = c.execute("SELECT e.net,e.pool,e.grp,e.ts,e.price,e.liq,k.hard_reason,k.chain_reason,k.age_min,k.mcap "
-                     "FROM entries e LEFT JOIN checks k ON k.id=e.check_id").fetchall()
+    ents = c.execute("SELECT e.net,e.pool,e.grp,e.ts,e.price,e.liq,k.hard_reason,k.chain_reason,k.age_min,k.mcap,"
+                     "p.token,k.dossier FROM entries e LEFT JOIN checks k ON k.id=e.check_id "
+                     "LEFT JOIN pools p ON p.net=e.net AND p.pool=e.pool").fetchall()
     snaps = {}
     for net, pool, grp, ts, price, liq, v6, v24, miss in c.execute(
             "SELECT net,pool,grp,ts,price,liq,vol_h6,vol_h24,missing FROM snaps ORDER BY ts"):
         snaps.setdefault((net, pool, grp), []).append((ts, price, liq, v6, v24, miss))
     out = []
-    for net, pool, grp, ts, price, liq, hr, cr, age, mcap in ents:
+    for net, pool, grp, ts, price, liq, hr, cr, age, mcap, token, dos in ents:
         out.append(dict(net=net, pool=pool, grp=grp, ts=ts, price=price, liq=liq, hard=hr, chain=cr,
-                        age=age, mcap=mcap, snaps=snaps.get((net, pool, grp), [])))
+                        age=age, mcap=mcap, token=token, dos=json.loads(dos) if dos else {},
+                        snaps=snaps.get((net, pool, grp), [])))
     return out
 
 
@@ -120,9 +123,16 @@ def build_report(c):
     t2 = c.execute("SELECT SUM(passed2) FROM checks").fetchone()[0] or 0
     p2s = c.execute("SELECT v FROM meta WHERE k='pass2_started_at'").fetchone()
     L.append(f" pass2(수정 규칙) 통과 {t2}건" + (f" — pass2 기록 시작 {kst(float(p2s[0]))}" if p2s else ""))
-    for col in ("hard_reason", "chain_reason", "chain_reason2"):
-        rows = c.execute(f"SELECT {col}, COUNT(*) FROM checks WHERE {col} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC").fetchall()
-        L.append(f" {col}: " + ", ".join(f"{r}={n}" for r, n in rows))
+    nets = [r[0] for r in c.execute("SELECT DISTINCT net FROM checks ORDER BY 1")]
+    for net in nets:
+        n_all, n_p, n_p2, n_hard_ok = c.execute(
+            "SELECT COUNT(*), SUM(passed), SUM(passed2), SUM(hard_reason IS NULL) FROM checks WHERE net=?", (net,)).fetchone()
+        L.append(f" ── {net}: 평가 {n_all}건 → 하드필터 통과 {n_hard_ok or 0} → pass {n_p or 0} / pass2 {n_p2 or 0}")
+        for col, lab in (("hard_reason", "하드탈락"), ("chain_reason", "체인탈락(pass)"), ("chain_reason2", "체인탈락(pass2)")):
+            rows = c.execute(f"SELECT {col}, COUNT(*) FROM checks WHERE net=? AND {col} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC",
+                             (net,)).fetchall()
+            if rows:
+                L.append(f"    {lab}: " + ", ".join(f"{r}={n}" for r, n in rows))
     for ts, net, msg in c.execute("SELECT * FROM net_errors ORDER BY ts DESC LIMIT 5"):
         L.append(f" ! {kst(ts)} {net}: {msg}")
     L.append("")
@@ -189,6 +199,46 @@ def build_report(c):
             L.append(f" {net if g == 'pass' else '':10s} {lab} {summ(xs)}")
     L.append("")
 
+    # LP 안전성 (EVM 체인: 하드필터 통과해 dossier가 있는 진입 건만)
+    L.append("[LP 상태별 러그 비율 — 하드필터 통과 토큰, EVM 체인 (pass/pass2/대조군 합산)]")
+    seen_tok, lp_rows = set(), []
+    for e in E:
+        d = e["dos"]
+        if e["net"] == "solana" or not d or (e["net"], e["pool"]) in seen_tok:
+            continue
+        seen_tok.add((e["net"], e["pool"]))
+        lp_rows.append((e, d))
+
+    def bucket(d):
+        v = d.get("lp_safe_pct")
+        if v is None:
+            return "LP 상태 미확인"
+        return "LP 90%+ 소각/락" if v >= 0.9 else ("LP 10~90% 소각/락" if v >= 0.1 else "LP 대부분 개인보유(<10%)")
+
+    for b in ("LP 90%+ 소각/락", "LP 10~90% 소각/락", "LP 대부분 개인보유(<10%)", "LP 상태 미확인"):
+        es = [e for e, d in lp_rows if bucket(d) == b]
+        fl = [f for f in (is_rug(e) for e in es) if f is not None]
+        r6 = [r for r in (at_horizon(e, 6) for e in es) if r is not None]
+        L.append(f" {b:22s} 러그 " + (f"{sum(fl)/len(fl):5.1%} ({sum(fl)}/{len(fl)})" if fl else "  -  ") + f" | 6h {summ(r6)}")
+    for lab, cond in (("LP 제공자 1명", lambda d: d.get("gp_lp_holder_count") == 1),
+                      ("LP 제공자 2명+", lambda d: (d.get("gp_lp_holder_count") or 0) >= 2)):
+        es = [e for e, d in lp_rows if cond(d)]
+        fl = [f for f in (is_rug(e) for e in es) if f is not None]
+        L.append(f" {lab:22s} 러그 " + (f"{sum(fl)/len(fl):5.1%} ({sum(fl)}/{len(fl)})" if fl else "  -  "))
+    gp_ok = sum(1 for _, d in lp_rows if d.get("gp_supported"))
+    L.append(f" (GoPlus 지원 확인 {gp_ok}/{len(lp_rows)}건, V2 LP {sum(1 for _, d in lp_rows if d.get('lp_v2'))}건)")
+    L.append("")
+
+    L.append("[최근 pass / pass2 20건 — CA는 토큰 주소, pool은 LP(풀) 주소]")
+    recent = sorted([e for e in E if e["grp"] in ("pass", "pass2")], key=lambda e: -e["ts"])[:20]
+    for e in recent:
+        r = at_horizon(e, 6)
+        lp = e["dos"].get("lp_safe_pct")
+        L.append(f" {kst(e['ts'])} {e['grp']:5s} {e['net']:9s} CA={e['token']}  "
+                 f"LP잠금={'-' if lp is None else f'{lp:.0%}'}  6h={'-' if r is None else f'{r:+.0%}'}  "
+                 f"러그={is_rug(e)}")
+    L.append("")
+
     # 판정
     L.append(CRITERIA_TEXT)
     rc = rug.get("control (탈락 대조군)")
@@ -213,12 +263,13 @@ def export_csv(c):
     E = load(c)
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["net", "pool", "grp", "entry_kst", "age_min", "mcap", "hard_reason", "chain_reason",
-                "ret_1h", "ret_6h", "ret_24h", "rug", "exit_rule_ret"])
+    w.writerow(["net", "token_ca", "pool", "grp", "entry_kst", "age_min", "mcap", "hard_reason", "chain_reason",
+                "ret_1h", "ret_6h", "ret_24h", "rug", "exit_rule_ret", "lp_safe_pct", "lp_holder_count", "sell_tax"])
     for e in E:
         x = exit_sim(e) if e["grp"] in ("pass", "pass2") else None
-        w.writerow([e["net"], e["pool"], e["grp"], kst(e["ts"]), round(e["age"] or 0, 1), e["mcap"], e["hard"], e["chain"],
-                    *[at_horizon(e, h) for h in HORIZONS], is_rug(e), x[0] if x else None])
+        w.writerow([e["net"], e["token"], e["pool"], e["grp"], kst(e["ts"]), round(e["age"] or 0, 1), e["mcap"], e["hard"],
+                    e["chain"], *[at_horizon(e, h) for h in HORIZONS], is_rug(e), x[0] if x else None,
+                    e["dos"].get("lp_safe_pct"), e["dos"].get("gp_lp_holder_count"), e["dos"].get("gp_sell_tax")])
     return buf.getvalue()
 
 

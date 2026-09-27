@@ -26,7 +26,7 @@ DB_PATH = os.environ.get("DB_PATH", "/data/memefwd.db")
 NETWORKS = [n.strip() for n in os.environ.get("NETWORKS", "solana,bsc,robinhood").split(",") if n.strip()]
 DISCOVERY_PAGES = int(os.environ.get("DISCOVERY_PAGES", "2"))
 DISCOVERY_EVERY_SEC = int(os.environ.get("DISCOVERY_EVERY_SEC", "900"))   # 가이드와 동일: 15분
-GT_RPM = float(os.environ.get("GT_RPM", "9"))                             # GeckoTerminal 무료 10/분 → 여유 두고 9
+GT_RPM = float(os.environ.get("GT_RPM", "6"))                             # GeckoTerminal 무료 한도 — 9에서 429가 잦아 6으로 낮춤
 CONTROL_SAMPLE = float(os.environ.get("CONTROL_SAMPLE", "0.35"))          # 대조군 추적 비율 (API 예산용)
 PASS_SNAP_HOURS = 24
 CONTROL_SNAP_HOURS = [1, 6, 24]
@@ -50,7 +50,18 @@ HARD = {
 
 GT = "https://api.geckoterminal.com/api/v2"
 HDR = {"accept": "application/json;version=20230302", "user-agent": "memefwd/1.0"}
-SOL_RPC = os.environ.get("SOL_RPC", "https://api.mainnet-beta.solana.com")
+SOL_RPC = os.environ.get("SOL_RPC", "https://api.mainnet-beta.solana.com").strip()
+if SOL_RPC and not SOL_RPC.startswith("http"):
+    # 주소 없이 API 키만 넣은 경우 → Helius 키로 간주해 전체 주소로 보정
+    SOL_RPC = f"https://mainnet.helius-rpc.com/?api-key={SOL_RPC}"
+EVM_RPC = {
+    "bsc": os.environ.get("BSC_RPC", "https://bsc-dataseed.bnbchain.org"),
+    "base": os.environ.get("BASE_RPC", "https://mainnet.base.org"),
+    "robinhood": os.environ.get("ROBINHOOD_RPC", "https://rpc.mainnet.chain.robinhood.com"),
+}
+GOPLUS_CHAIN = {"bsc": "56", "base": "8453", "robinhood": "4663"}
+BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+DEAD = ("0x000000000000000000000000000000000000dead", "0x0000000000000000000000000000000000000000")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("memefwd")
@@ -296,7 +307,80 @@ def sol_top_wallet_ex_pda(mint):
         return None
 
 
-def dossier(net, token):
+# ── LP(유동성) 안전성: 기록 전용, 필터 판정에는 아직 안 씀 ──
+def _eth_call(net, to, data):
+    r = requests.post(EVM_RPC[net], json={"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                                          "params": [{"to": to, "data": data}, "latest"]},
+                      headers={"user-agent": BROWSER_UA, "content-type": "application/json"}, timeout=15)
+    j = r.json()
+    if "error" in j or j.get("result") in (None, "0x"):
+        return None
+    return int(j["result"], 16)
+
+
+def evm_lp_burn(net, pool):
+    """V2 풀(LP가 ERC20)이면 LP 총량 중 소각주소(0xdead/0x0)에 있는 비율. V3 등은 lp_v2=False."""
+    if net not in EVM_RPC:
+        return {}
+    try:
+        supply = _eth_call(net, pool, "0x18160ddd")               # totalSupply()
+        if not supply:
+            return {"lp_v2": False}
+        burned = 0
+        for a in DEAD:
+            b = _eth_call(net, pool, "0x70a08231" + a[2:].rjust(64, "0"))   # balanceOf(dead)
+            burned += b or 0
+        return {"lp_v2": True, "lp_burned_pct": burned / supply}
+    except Exception as e:
+        log.info("LP RPC 실패 %s %s: %s", net, pool, e)
+        return {"lp_rpc_error": True}
+
+
+GP_LIMIT = RateLimiter(float(os.environ.get("GOPLUS_RPM", "20")))
+
+
+def goplus(net, token):
+    """GoPlus 토큰 보안: LP 보유자·락 여부, 제작자 보유율, 세금, 권한 위험. 미지원 체인이면 빈 dict."""
+    cid = GOPLUS_CHAIN.get(net)
+    if not cid:
+        return {}
+    GP_LIMIT.wait()
+    try:
+        j = requests.get(f"https://api.gopluslabs.io/api/v1/token_security/{cid}",
+                         params={"contract_addresses": token}, timeout=20).json()
+        r = (j.get("result") or {}).get(token.lower())
+        if not r:
+            return {"gp_supported": False}
+    except Exception as e:
+        log.info("GoPlus 실패 %s %s: %s", net, token, e)
+        return {"gp_error": True}
+    lps = r.get("lp_holders") or []
+    locked = sum(fnum(h.get("percent")) or 0 for h in lps
+                 if str(h.get("is_locked")) == "1" or (h.get("address") or "").lower() in DEAD)
+    top = max(lps, key=lambda h: fnum(h.get("percent")) or 0) if lps else {}
+    return {
+        "gp_supported": True,
+        "gp_lp_holder_count": int(fnum(r.get("lp_holder_count")) or 0) if r.get("lp_holder_count") is not None else None,
+        "gp_lp_locked_pct": locked if lps else None,
+        "gp_top_lp_pct": fnum(top.get("percent")),
+        "gp_top_lp_is_contract": top.get("is_contract"),
+        "gp_creator_pct": fnum(r.get("creator_percent")),
+        "gp_owner_pct": fnum(r.get("owner_percent")),
+        "gp_buy_tax": fnum(r.get("buy_tax")), "gp_sell_tax": fnum(r.get("sell_tax")),
+        "gp_is_honeypot": r.get("is_honeypot"), "gp_cannot_sell_all": r.get("cannot_sell_all"),
+        "gp_is_mintable": r.get("is_mintable"), "gp_hidden_owner": r.get("hidden_owner"),
+        "gp_owner_change_balance": r.get("owner_change_balance"), "gp_transfer_pausable": r.get("transfer_pausable"),
+        "gp_is_open_source": r.get("is_open_source"),
+    }
+
+
+def lp_safe_pct(d):
+    """LP 중 '뺄 수 없는' 비율(소각 또는 락). RPC와 GoPlus 중 큰 값. 모르면 None."""
+    vals = [v for v in (d.get("lp_burned_pct"), d.get("gp_lp_locked_pct")) if v is not None]
+    return max(vals) if vals else None
+
+
+def dossier(net, token, pool=None):
     j = gt_get(f"/networks/{net}/tokens/{token}/info")
     if not j:
         return None
@@ -316,6 +400,10 @@ def dossier(net, token):
     if net == "solana":
         d["top_wallet_percent"] = sol_top_wallet(token)
         d["top_wallet_ex_pda"] = sol_top_wallet_ex_pda(token)
+    elif pool:
+        d.update(evm_lp_burn(net, pool))
+        d.update(goplus(net, token))
+        d["lp_safe_pct"] = lp_safe_pct(d)
     return d
 
 
@@ -457,7 +545,7 @@ def evaluate_due(db, max_pools=300):
             hard = free_kill(m, age_min) or trade_kill(m)
             chain_r = chain_r2 = dos = None
             if hard is None:
-                dos = dossier(net, token)
+                dos = dossier(net, token, pool)
                 chain_r = chain_kill(net, dos) if dos else "dossier_failed"
                 chain_r2 = chain_kill_v2(net, dos) if dos else "dossier_failed"
             passed = int(not g_done and hard is None and chain_r is None)
@@ -478,7 +566,9 @@ def evaluate_due(db, max_pools=300):
                 if ok:
                     db.execute("INSERT OR IGNORE INTO entries(net,pool,grp,ts,price,liq,check_id,next_snap) VALUES(?,?,?,?,?,?,?,?)",
                                (net, pool, grp, now, m["price"], m["liq"], cid, now + 900))
-                    log.info("%s %s %s age=%.0fm liq=%.0f mcap=%.0f", grp.upper(), net, pool, age_min, m["liq"] or 0, m["mcap"] or 0)
+                    log.info("%s %s CA=%s (pool=%s) age=%.0fm liq=%.0f mcap=%.0f lp_safe=%s",
+                             grp.upper(), net, token, pool, age_min, m["liq"] or 0, m["mcap"] or 0,
+                             (dos or {}).get("lp_safe_pct"))
             n_pass += passed
             n_pass2 += passed2
             g_done = g_done or passed
