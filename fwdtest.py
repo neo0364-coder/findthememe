@@ -21,12 +21,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
-VERSION = "v5-tradeflow (2026-09-27)"   # 배포 확인용: 시작 로그·리포트 첫 줄에 표시
+VERSION = "v6-adaptive-rate (2026-09-27)"   # 배포 확인용: 시작 로그·리포트 첫 줄에 표시
 
 # ───────────────────────── 설정 ─────────────────────────
 DB_PATH = os.environ.get("DB_PATH", "/data/memefwd.db")
 NETWORKS = [n.strip() for n in os.environ.get("NETWORKS", "solana,bsc,robinhood").split(",") if n.strip()]
-DISCOVERY_PAGES = int(os.environ.get("DISCOVERY_PAGES", "2"))
+DISCOVERY_PAGES = int(os.environ.get("DISCOVERY_PAGES", "1"))           # 429 부담 줄이려 2→1 (체인당 최신 20개)
 DISCOVERY_EVERY_SEC = int(os.environ.get("DISCOVERY_EVERY_SEC", "900"))   # 가이드와 동일: 15분
 GT_RPM = float(os.environ.get("GT_RPM", "6"))                             # GeckoTerminal 무료 한도 — 9에서 429가 잦아 6으로 낮춤
 CONTROL_SAMPLE = float(os.environ.get("CONTROL_SAMPLE", "0.35"))          # 대조군 추적 비율 (API 예산용)
@@ -88,15 +88,34 @@ def parse_ts(s):
 
 
 class RateLimiter:
-    def __init__(self, per_min):
-        self.gap = 60.0 / per_min
+    """적응형: 429를 받으면 속도를 낮추고(×0.7), 성공이 이어지면 천천히 원래 속도로 복귀."""
+    def __init__(self, per_min, floor_per_min=2.0):
+        self.base_gap = 60.0 / per_min
+        self.gap = self.base_gap
+        self.max_gap = 60.0 / floor_per_min
         self.last = 0.0
+        self.ok_streak = 0
+        self.n429 = 0
 
     def wait(self):
         d = self.last + self.gap - time.time()
         if d > 0:
             time.sleep(d)
         self.last = time.time()
+
+    def success(self):
+        self.ok_streak += 1
+        if self.ok_streak >= 30 and self.gap > self.base_gap:
+            self.gap = max(self.base_gap, self.gap * 0.9)
+            self.ok_streak = 0
+
+    def throttled(self):
+        self.n429 += 1
+        self.ok_streak = 0
+        self.gap = min(self.max_gap, self.gap / 0.7)
+
+    def rpm(self):
+        return 60.0 / self.gap
 
 
 GT_LIMIT = RateLimiter(GT_RPM)
@@ -113,8 +132,11 @@ def gt_get(path, params=None):
             time.sleep(5)
             continue
         if r.status_code == 429:
-            log.warning("GT 429 — 60초 대기")
-            time.sleep(60)
+            GT_LIMIT.throttled()
+            ra = r.headers.get("retry-after")
+            wait = float(ra) if ra and ra.replace(".", "", 1).isdigit() else 20.0
+            log.warning("GT 429 — %.0f초 대기, 속도 분당 %.1f회로 조정 (누적 %d회)", wait, GT_LIMIT.rpm(), GT_LIMIT.n429)
+            time.sleep(wait)
             continue
         if r.status_code == 404:
             return None
@@ -122,6 +144,7 @@ def gt_get(path, params=None):
             time.sleep(10)
             continue
         r.raise_for_status()
+        GT_LIMIT.success()
         return r.json()
     return None
 
