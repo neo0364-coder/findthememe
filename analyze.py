@@ -57,6 +57,15 @@ def features(c):
             "B_buy_sell_m5": sdiv(m5.get("buys"), (m5.get("sells") or 0) + 1),
             "B_chg_m5": R_float(chg.get("m5")),
         }
+        # C항목: 거래 흐름(tr_) · LP/보안(gp_, lp_) — dossier에 있는 숫자형 값 전부
+        for k, v in d.items():
+            if k != "gp_supported" and (k.startswith("tr_") or k.startswith("gp_") or k in ("lp_safe_pct", "lp_burned_pct",
+                                                                   "top_10_percent", "holder_count")):
+                fv = R_float(v)
+                if fv is not None:
+                    f["C_" + k] = fv
+        if liq and d.get("holder_count"):
+            f["C_liq_per_holder"] = liq / float(d["holder_count"])
         rg = [r for r in regime.get(net, []) if r[0] <= ets]
         if rg:
             _, lph, mv, mc = rg[-1]
@@ -135,7 +144,59 @@ def run(c, train_days=3.0, test_days=3.0):
             ok = (s_te["n"] >= MIN_N and base_te["n"] and s_te["med"] > base_te["med"] and s_te["med"] > 0)
             L.append(f"  {nm} {side} {cut:.4g}: {fmt(s_te)}  → {'채택 후보' if ok else '기각'}")
     L.append("\n채택 후보가 나와도 곧바로 실전 X — 새 기간(다음 3일)에서 한 번 더 확인 후 결정.")
+    L.append("")
+    L.append(winners(rows))
     return "\n".join(L)
+
+
+def auc(pos, neg):
+    """승자 값이 패자 값보다 클 확률. 0.5=정보 없음, 0.7+ 또는 0.3- 이면 주목."""
+    if not pos or not neg:
+        return None
+    allv = sorted([(v, 1) for v in pos] + [(v, 0) for v in neg])
+    rank_sum, i = 0.0, 0
+    while i < len(allv):                      # 동점은 평균 순위 (Mann-Whitney U)
+        j = i
+        while j < len(allv) and allv[j][0] == allv[i][0]:
+            j += 1
+        r = (i + j + 1) / 2
+        rank_sum += r * sum(1 for k in range(i, j) if allv[k][1])
+        i = j
+    return (rank_sum - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg))
+
+
+def winners(rows, thr=float(os.environ.get("WINNER_THR", "0.5"))):
+    """6h +50% 이상 '대박' 토큰과 나머지를 진입 시점 특징으로 비교 (pass+pass2, 중복 풀 제거)."""
+    seen, P = set(), []
+    for r in rows:
+        if r["grp"] in ("pass", "pass2") and r["ret"] is not None:
+            key = (r["f"].get("A_age_min"), r["ts"])
+            if key not in seen:
+                seen.add(key)
+                P.append(r)
+    W = [r for r in P if r["ret"] >= thr]
+    Lr = [r for r in P if r["ret"] < thr]
+    out = [f"[대박 토큰 해부 — 6h +{thr:.0%} 이상 {len(W)}건 vs 나머지 {len(Lr)}건, 진입 시점 값만 사용(미래정보 없음)]"]
+    if len(W) < 5:
+        out.append(" 대박 표본 5건 미만 — 아직 비교 불가")
+        return "\n".join(out)
+    if len(W) < 20:
+        out.append(f" ※ 대박 {len(W)}건: 아래 차이는 우연일 가능성이 큼. 20건 이상 쌓이면 신뢰도 상승")
+    names = sorted({k for r in P for k in r["f"]})
+    res = []
+    for nm in names:
+        pw = [r["f"][nm] for r in W if r["f"].get(nm) is not None]
+        pl = [r["f"][nm] for r in Lr if r["f"].get(nm) is not None]
+        if len(pw) < 5 or len(pl) < 5:
+            continue
+        a_ = auc(pw, pl)
+        res.append((abs(a_ - 0.5), nm, a_, st.median(pw), st.median(pl), len(pw)))
+    res.sort(reverse=True)
+    out.append(f" {'특징':28s} {'AUC':>5s} {'대박 중앙':>12s} {'나머지 중앙':>12s}")
+    for _, nm, a_, mw, ml, n in res[:15]:
+        out.append(f" {nm:28s} {a_:5.2f} {mw:12.4g} {ml:12.4g}")
+    out.append(" AUC: 0.5=구분력 없음 / 0.7 이상=대박일수록 값이 큼 / 0.3 이하=대박일수록 값이 작음")
+    return "\n".join(out)
 
 
 if __name__ == "__main__":

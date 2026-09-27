@@ -91,6 +91,35 @@ def exit_sim(e, stop=None):
     return last[1] / e["price"] - 1, last[0]
 
 
+def rug_time(e):
+    """15분 스냅 기준 러그(-80% / 유동성 -80% / 풀 소멸) 첫 발생까지 걸린 시간(시간). 없으면 None."""
+    for s in e["snaps"]:
+        if s[0] > e["ts"] + 24 * 3600 + 900:
+            break
+        if s[5] or s[1] is None or s[1] <= e["price"] * 0.2 or (e["liq"] and s[2] is not None and s[2] <= e["liq"] * 0.2):
+            return (s[0] - e["ts"]) / 3600
+    return None
+
+
+def delayed_entry(e, wait_h, hold_h):
+    """'살아남은 뒤 진입': 통과 후 wait_h 시간 기다렸다가, 그때까지 러그가 없으면 그 가격에 진입해 hold_h 보유.
+    반환: ('avoided'|'entered'|None, 수익률)"""
+    t_in = e["ts"] + wait_h * 3600
+    rt = rug_time(e)
+    if rt is not None and rt <= wait_h:
+        return "avoided", None
+    s_in = next((s for s in e["snaps"] if t_in - 450 <= s[0] <= t_in + 1800), None)
+    if not s_in or s_in[1] is None:
+        return None, None
+    t_out = s_in[0] + hold_h * 3600
+    s_out = next((s for s in e["snaps"] if t_out - 450 <= s[0] <= t_out + 1800), None)
+    if not s_out:
+        return None, None
+    if s_out[5] or s_out[1] is None:
+        return "entered", -1.0
+    return "entered", s_out[1] / s_in[1] - 1
+
+
 def boot_ci(xs, fn=st.mean, n=2000):
     if len(xs) < 5:
         return None
@@ -142,6 +171,7 @@ def build_report(c):
         "pass2 (수정 규칙: 빈값=탈락, 풀계정 제외)": [e for e in E if e["grp"] == "pass2"],
         "control (탈락 대조군)": [e for e in E if e["grp"] == "control"],
         "  └ 하드통과·top_wallet만 탈락": [e for e in E if e["grp"] == "control" and e["chain"] == "top_wallet"],
+        "  └ 하드통과·체인탈락 대조군(유동성 충분, 참고용)": [e for e in E if e["grp"] == "control" and e["hard"] is None],
     }
     L.append("[보유기간별 gross 수익률]")
     res6 = {}
@@ -160,6 +190,31 @@ def build_report(c):
         flags = [f for f in (is_rug(e) for e in es) if f is not None]
         rug[name] = (sum(flags) / len(flags)) if flags else None
         L.append(f" {name}: " + (f"{rug[name]:.1%} ({sum(flags)}/{len(flags)})" if flags else "데이터 없음"))
+    L.append("")
+
+    # 러그 속도 + 살아남은 뒤 진입
+    L.append("[러그는 얼마나 빨리 오나 — pass+pass2, 15분 스냅 기준]")
+    PP = [e for e in E if e["grp"] in ("pass", "pass2")]
+    rts = [t for t in (rug_time(e) for e in PP) if t is not None]
+    done = [e for e in PP if e["snaps"] and e["snaps"][-1][0] >= e["ts"] + 6 * 3600]
+    if rts:
+        L.append(f" 러그 {len(rts)}건 — 걸린 시간 중앙값 {st.median(rts):.1f}h, "
+                 f"1h 이내 {sum(t <= 1 for t in rts)/len(rts):.0%}, 3h 이내 {sum(t <= 3 for t in rts)/len(rts):.0%}, "
+                 f"6h 이내 {sum(t <= 6 for t in rts)/len(rts):.0%}")
+    else:
+        L.append(" 러그 표본 없음")
+    L.append("[살아남은 뒤 진입 시뮬레이션 — 통과 후 N시간 기다려 러그 안 났으면 그때 진입, 6h 보유, 비용 차감]")
+    for wait in (1, 2, 3, 6):
+        outs = [delayed_entry(e, wait, 6) for e in PP]
+        av = sum(1 for o in outs if o[0] == "avoided")
+        rs = [o[1] - COST for o in outs if o[0] == "entered"]
+        if rs:
+            ci = boot_ci(rs)
+            L.append(f" {wait}h 대기: 러그 회피 {av}건, 진입 {len(rs)}건 → 중앙 {st.median(rs):+.1%} 평균 {st.mean(rs):+.1%} "
+                     f"승률 {sum(1 for x in rs if x > 0)/len(rs):.0%}" + (f" 95%CI[{ci[0]:+.1%},{ci[1]:+.1%}]" if ci else "")
+                     + f" / 진입 후 다시 러그 {sum(1 for x in rs if x <= -0.8 - COST)}건")
+        else:
+            L.append(f" {wait}h 대기: 러그 회피 {av}건, 진입 표본 없음 (아직 {wait + 6}h 경과 안 됨)")
     L.append("")
 
     sims = {}

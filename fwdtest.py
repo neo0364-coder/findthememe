@@ -380,6 +380,51 @@ def lp_safe_pct(d):
     return max(vals) if vals else None
 
 
+# ── 거래 흐름: '진짜 사람들의 거래'인지 '연출된 거래'인지 (기록 전용) ──
+def trade_flow(net, pool):
+    """최근 체결(최대 300건)로 지갑 분산도·자전거래·봇 흔적을 계산. 모든 체인 공통."""
+    j = gt_get(f"/networks/{net}/pools/{pool}/trades")
+    if not j:
+        return {}
+    rows = []
+    for t in j.get("data", []):
+        a = t.get("attributes") or {}
+        w = (a.get("tx_from_address") or "").lower()
+        v = fnum(a.get("volume_in_usd"))
+        if not w or v is None:
+            continue
+        rows.append((w, v, a.get("kind"), a.get("block_number"), parse_ts(a.get("block_timestamp"))))
+    if len(rows) < 10:
+        return {"tr_n": len(rows)}
+    vol_by_w, kinds_by_w, block_buys = {}, {}, {}
+    for w, v, k, b, _ in rows:
+        vol_by_w[w] = vol_by_w.get(w, 0) + v
+        kinds_by_w.setdefault(w, set()).add(k)
+        if k == "buy":
+            block_buys[b] = block_buys.get(b, 0) + 1
+    tot = sum(vol_by_w.values()) or 1
+    top5 = sum(sorted(vol_by_w.values(), reverse=True)[:5])
+    buys = [r for r in rows if r[2] == "buy"]
+    sells = [r for r in rows if r[2] == "sell"]
+    ts = [r[4] for r in rows if r[4]]
+    span_min = (max(ts) - min(ts)) / 60 if len(ts) > 1 else None
+    vols = sorted(r[1] for r in rows)
+    return {
+        "tr_n": len(rows),
+        "tr_span_min": span_min,                                   # 300건이 몇 분 동안 쌓였나 (짧을수록 과열/봇)
+        "tr_uniq_wallets": len(vol_by_w),
+        "tr_trades_per_wallet": len(rows) / len(vol_by_w),        # 높으면 소수 지갑이 반복 거래(자전거래 의심)
+        "tr_top5_vol_share": top5 / tot,                           # 상위 5지갑 거래량 비중
+        "tr_uniq_buyers": len({r[0] for r in buys}),
+        "tr_uniq_sellers": len({r[0] for r in sells}),
+        "tr_roundtrip_wallet_share": sum(1 for k in kinds_by_w.values() if len(k) > 1) / len(kinds_by_w),
+        "tr_dust_share": sum(1 for v in vols if v < 2) / len(vols),   # $2 미만 먼지 거래 비율(봇 스팸)
+        "tr_bundle_buy_share": (sum(n for n in block_buys.values() if n >= 3) / len(buys)) if buys else None,
+        "tr_median_usd": vols[len(vols) // 2],
+        "tr_net_buy_flow": (sum(r[1] for r in buys) - sum(r[1] for r in sells)) / tot,
+    }
+
+
 def dossier(net, token, pool=None):
     j = gt_get(f"/networks/{net}/tokens/{token}/info")
     if not j:
@@ -404,6 +449,8 @@ def dossier(net, token, pool=None):
         d.update(evm_lp_burn(net, pool))
         d.update(goplus(net, token))
         d["lp_safe_pct"] = lp_safe_pct(d)
+    if pool:
+        d.update(trade_flow(net, pool))
     return d
 
 
