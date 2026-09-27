@@ -142,6 +142,11 @@ def build_report(c):
     E = load(c)
     started = float((c.execute("SELECT v FROM meta WHERE k='started_at'").fetchone() or [time.time()])[0])
     L = []
+    try:
+        from fwdtest import VERSION
+    except Exception:
+        VERSION = "?"
+    L.append(f"[버전 {VERSION}]")
     L.append(f"밈코인 필터 포워드 테스트 리포트 — {kst(time.time())} (시작 {kst(started)}, 경과 {(time.time()-started)/86400:.1f}일)")
     L.append(f"왕복비용 가정 {COST:.0%} / 수익률은 비용 차감 전 gross, '순수익' 항목만 차감\n")
 

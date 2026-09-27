@@ -21,6 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
+VERSION = "v5-tradeflow (2026-09-27)"   # 배포 확인용: 시작 로그·리포트 첫 줄에 표시
+
 # ───────────────────────── 설정 ─────────────────────────
 DB_PATH = os.environ.get("DB_PATH", "/data/memefwd.db")
 NETWORKS = [n.strip() for n in os.environ.get("NETWORKS", "solana,bsc,robinhood").split(",") if n.strip()]
@@ -703,6 +705,7 @@ def serve(db_path):
 def main():
     db = db_connect()
     threading.Thread(target=serve, args=(DB_PATH,), daemon=True).start()
+    log.info("버전 %s", VERSION)
     log.info("시작: networks=%s, GT_RPM=%s, DB=%s, 리포트 포트 %d", NETWORKS, GT_RPM, DB_PATH, PORT)
     last_disc = 0.0
     while True:
