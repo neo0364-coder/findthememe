@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
-VERSION = "v9.2-entry-rules (2026-09-28)"   # 배포 확인용: 시작 로그·리포트 첫 줄에 표시
+VERSION = "v9.3-stale-death (2026-09-28)"   # 배포 확인용: 시작 로그·리포트 첫 줄에 표시
 
 # ───────────────────────── 설정 ─────────────────────────
 DB_PATH = os.environ.get("DB_PATH", "/data/memefwd.db")

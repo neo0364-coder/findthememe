@@ -43,21 +43,48 @@ def load(c):
     return out
 
 
+LIQ_FLOOR = float(os.environ.get("LIQ_FLOOR", "1000"))       # 유동성 절대 하한($) — 이 아래면 사망
+STALE_VOL = float(os.environ.get("STALE_VOL_H6", "100"))     # 기록 6h 이후 6h 거래량이 이 미만이면 '거래 정지 = 사망'
+
+
+def death(e, s):
+    """스냅 s 시점의 사망 사유. None=생존.
+    gone: 풀 소멸 / price: 첫 기록가 대비 -80% / liq: 최고 유동성 대비 -80% 또는 $1,000 미만
+    stale: 기록 6h 이후 6h 거래량이 거의 0 — 데이터상 가격·유동성이 멈춰 보여도 실제로는 팔 수 없는 상태
+    (v9.3: GeckoTerminal이 유동성 $0.7짜리 풀을 $111k로 보고한 사례가 있어 추가)"""
+    if s[5] or s[1] is None:
+        return "gone"
+    if s[1] <= e["price"] * 0.2:
+        return "price"
+    max_liq = max([e["liq"] or 0] + [x[2] for x in e["snaps"] if x[0] <= s[0] and x[2] is not None])
+    if s[2] is not None and (s[2] < LIQ_FLOOR or (max_liq and s[2] <= max_liq * 0.2)):
+        return "liq"
+    if s[0] - e["ts"] >= 6 * 3600 and s[3] is not None and s[3] < STALE_VOL:
+        return "stale"
+    return None
+
+
+def exit_value(e, s, base_price):
+    """s 시점에 팔았을 때 수익률. 가격 폭락이면 실제 가격, 그 외 사망(소멸·유동성·거래정지)이면 -100%."""
+    d = death(e, s)
+    if d in ("gone", "liq", "stale"):
+        return -1.0
+    return s[1] / base_price - 1
+
+
 def at_horizon(e, h):
-    """entry 후 h시간 시점 스냅(허용오차 ±30분). 풀이 사라졌으면 -100%로 처리."""
+    """entry 후 h시간 시점 스냅(허용오차 -7.5분~+30분)."""
     target = e["ts"] + h * 3600
     for s in e["snaps"]:
         if s[0] >= target - 450:
             if s[0] > target + 1800:
                 return None
-            if s[5] or s[1] is None:
-                return -1.0
-            return s[1] / e["price"] - 1
+            return exit_value(e, s, e["price"])
     return None
 
 
 def is_rug(e):
-    """1/6/24h 시점만 사용(두 그룹 동일한 해상도): 가격 -80% 이하, 유동성 80%+ 감소, 또는 풀 소멸."""
+    """1/6/24h 시점만 사용(두 그룹 동일한 해상도)."""
     seen = False
     for h in HORIZONS:
         target = e["ts"] + h * 3600
@@ -65,11 +92,7 @@ def is_rug(e):
         if not s:
             continue
         seen = True
-        if s[5] or s[1] is None:
-            return True
-        if s[1] <= e["price"] * 0.2:
-            return True
-        if e["liq"] and s[2] is not None and s[2] <= e["liq"] * 0.2:
+        if death(e, s):
             return True
     return False if seen else None
 
@@ -80,8 +103,8 @@ def exit_sim(e, stop=None):
     if not s_list or s_list[-1][0] < e["ts"] + 24 * 3600 - 900:
         return None  # 아직 24h 안 지남
     for s in s_list:
-        if s[5] or s[1] is None:
-            return -1.0, s[0]
+        if death(e, s):
+            return exit_value(e, s, e["price"]), s[0]
         r = s[1] / e["price"] - 1
         if stop is not None and r <= -stop:
             return r, s[0]
@@ -92,18 +115,17 @@ def exit_sim(e, stop=None):
 
 
 def rug_time(e, upto_h=24):
-    """15분 스냅 기준 러그(-80% / 유동성 -80% / 풀 소멸) 첫 발생까지 걸린 시간(시간). 없으면 None."""
+    """15분 스냅 기준 첫 사망(death)까지 걸린 시간(시간). 없으면 None."""
     for s in e["snaps"]:
         if s[0] > e["ts"] + upto_h * 3600 + 900:
             break
-        if s[5] or s[1] is None or s[1] <= e["price"] * 0.2 or (e["liq"] and s[2] is not None and s[2] <= e["liq"] * 0.2):
+        if death(e, s):
             return (s[0] - e["ts"]) / 3600
     return None
 
 
 def delayed_entry(e, wait_h, hold_h):
-    """'살아남은 뒤 진입': 통과 후 wait_h 시간 기다렸다가, 그때까지 러그가 없으면 그 가격에 진입해 hold_h 보유.
-    반환 dict: status('avoided'|'entered'|None), ret, vol_h6_in, liq_in, rerug(보유 중 러그 여부)"""
+    """'살아남은 뒤 진입': 통과 후 wait_h 시간 기다렸다가, 그때까지 사망이 없으면 그 가격에 진입해 hold_h 보유."""
     t_in = e["ts"] + wait_h * 3600
     rt = rug_time(e, upto_h=wait_h + hold_h)
     if rt is not None and rt <= wait_h:
@@ -115,8 +137,7 @@ def delayed_entry(e, wait_h, hold_h):
     s_out = next((s for s in e["snaps"] if t_out - 450 <= s[0] <= t_out + 1800), None)
     if not s_out:
         return {"status": None}
-    ret = -1.0 if (s_out[5] or s_out[1] is None) else s_out[1] / s_in[1] - 1
-    return {"status": "entered", "ret": ret, "vol_h6_in": s_in[3], "liq_in": s_in[2],
+    return {"status": "entered", "ret": exit_value(e, s_out, s_in[1]), "vol_h6_in": s_in[3], "liq_in": s_in[2],
             "rerug": rt is not None and rt > wait_h}
 
 
@@ -281,8 +302,8 @@ def build_report(c):
         t = e["ts"] + h * 3600
         return next((s for s in e["snaps"] if t - 450 <= s[0] <= t + tol_after), None)
 
-    def dead(s, p0, l0):
-        return s is None or s[5] or s[1] is None or s[1] <= p0 * 0.2 or (l0 and s[2] is not None and s[2] <= l0 * 0.2)
+    def dead(s, e):
+        return s is None or death(e, s) is not None
 
     reached = survived = 0
     rows_sv = []
@@ -292,7 +313,7 @@ def build_report(c):
             continue                       # 아직 12h 안 됨
         reached += 1
         early = [snap_at(e, h) for h in (3, 6)]
-        if any(s is not None and dead(s, e["price"], e["liq"]) for s in early) or dead(s12, e["price"], e["liq"]):
+        if any(s is not None and dead(s, e) for s in early) or dead(s12, e):
             continue
         survived += 1
         act = (s12[3] or 0) >= ZOMBIE_VOL
@@ -309,11 +330,10 @@ def build_report(c):
                 if e["ts"] + (h_out + 1) * 3600 > time.time():
                     continue
                 out[hold] = (-1.0, True)
-            elif so[5] or so[1] is None:
-                out[hold] = (-1.0, True)
             else:
-                r_ = so[1] / s12[1] - 1
-                out[hold] = (r_, r_ <= -0.8 or (s12[2] and so[2] is not None and so[2] <= s12[2] * 0.2))
+                d_ = death(e, so)
+                r_ = exit_value(e, so, s12[1])
+                out[hold] = (r_, d_ is not None or r_ <= -0.8)
         rows_sv.append(out)
     n_act = sum(1 for o in rows_sv if o["active"])
     L.append(f" 12h 도달 {reached}개 → 생존 {survived}개 ({survived/reached:.0%} ) → 활성 {n_act}개" if reached else " 12h 도달 표본 없음")
@@ -368,7 +388,7 @@ def build_report(c):
         L.append(f"[가이드 청산규칙 시뮬레이션 — {gname}, 순수익(비용 차감)]")
         for label, stop in (("가이드 규칙 그대로", None), ("+ 손절 -30% 추가", 0.30)):
             rs = [x for x in (exit_sim(e, stop) for e in P) if x]
-            net = [r - COST for r, _ in rs]
+            net, _bad = clean([r - COST for r, _ in rs])
             sims[(gname, label)] = net
             if net:
                 ci = boot_ci(net)
@@ -438,8 +458,8 @@ def build_report(c):
         last = e["snaps"][-1]
         if now_ts - last[0] > 2 * 3600 or last[5] or last[1] is None:
             continue                                   # 2시간 넘게 확인 안 됐거나 풀 소멸
-        if rug_time(e, upto_h=48) is not None:
-            continue                                   # 한 번이라도 러그 기준에 걸린 토큰 제외
+        if rug_time(e, upto_h=48) is not None or death(e, last):
+            continue                                   # 한 번이라도 사망 기준(거래정지 포함)에 걸린 토큰 제외
         ret = last[1] / e["price"] - 1
         if ret <= 0 or ret > SUSPECT:
             continue
