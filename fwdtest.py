@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
-VERSION = "v8-survivor (2026-09-28)"   # 배포 확인용: 시작 로그·리포트 첫 줄에 표시
+VERSION = "v9-survivor-wide (2026-09-28)"   # 배포 확인용: 시작 로그·리포트 첫 줄에 표시
 
 # ───────────────────────── 설정 ─────────────────────────
 DB_PATH = os.environ.get("DB_PATH", "/data/memefwd.db")
@@ -32,6 +32,8 @@ GT_RPM = float(os.environ.get("GT_RPM", "6"))                             # Geck
 CONTROL_SAMPLE = float(os.environ.get("CONTROL_SAMPLE", "0.35"))          # 대조군 추적 비율 (API 예산용)
 PASS_SNAP_HOURS = 30                                                      # 12h 대기+12h 보유 분석용으로 24→30
 CONTROL_SNAP_HOURS = [1, 6, 24]
+SURV_SNAP_HOURS = [3, 6, 12, 18, 24]   # v9 생존자 확장: 하드필터 통과 토큰 전체를 가이드 체인필터와 무관하게 추적
+SNAP_SCHEDULE = {"control": CONTROL_SNAP_HOURS, "surv": SURV_SNAP_HOURS}
 CHECK_AGES_MIN = [20, 45, 90, 180, 360, 720, 1440, 2880, 4320]            # 재평가 시점(상장 후 분)
 PORT = int(os.environ.get("PORT", "8080"))
 REPORT_TOKEN = os.environ.get("REPORT_TOKEN", "")                          # 설정 시 ?key=값 필요
@@ -194,7 +196,8 @@ def db_connect():
         c.execute("ALTER TABLE pools ADD COLUMN v2_done INTEGER DEFAULT 0")
         c.execute("UPDATE pools SET guide_done=1, v2_done=1 WHERE done=1")
     c.execute("INSERT OR IGNORE INTO meta VALUES('pass2_started_at', ?)", (str(time.time()),))
-    c.execute("INSERT OR IGNORE INTO meta VALUES('survivor_criteria_at', ?)", (str(time.time()),))   # 생존자 기준 고정 시각
+    c.execute("INSERT OR IGNORE INTO meta VALUES('survivor_criteria_at', ?)", (str(time.time()),))
+    c.execute("INSERT OR IGNORE INTO meta VALUES('surv2_criteria_at', ?)", (str(time.time()),))   # v9 확장 생존자 기준 고정   # 생존자 기준 고정 시각
     c.execute("INSERT OR IGNORE INTO meta VALUES('started_at', ?)", (str(time.time()),))
     c.commit()
     return c
@@ -697,6 +700,10 @@ def evaluate_due(db, max_pools=300):
             n_pass2 += passed2
             g_done = g_done or passed
             v_done = v_done or passed2
+            if hard is None:
+                # v9: 하드필터(유동성·거래량·시총·거래수)를 처음 통과한 시점을 기준으로 생존 추적 (체인필터 결과와 무관)
+                db.execute("INSERT OR IGNORE INTO entries(net,pool,grp,ts,price,liq,check_id,next_snap) VALUES(?,?,?,?,?,?,?,?)",
+                           (net, pool, "surv", now, m["price"], m["liq"], cid, now + SURV_SNAP_HOURS[0] * 3600))
             if not passed and not has_control and age_min >= HARD["min_age_minutes"]:
                 # 대조군: 처음 '평가 가능 나이'에 가이드 규칙으로 탈락한 토큰, 예산 위해 샘플링
                 has_control = 1
@@ -729,12 +736,13 @@ def snapshot_due(db):
                 db.execute("UPDATE entries SET next_snap=?, snap_idx=?, closed=? WHERE net=? AND pool=? AND grp=?",
                            (nxt, sidx + 1, closed, net, pool, grp))
             else:
+                sched = SNAP_SCHEDULE.get(grp, CONTROL_SNAP_HOURS)
                 k = sidx + 1
-                if k >= len(CONTROL_SNAP_HOURS):
+                if k >= len(sched):
                     db.execute("UPDATE entries SET snap_idx=?, closed=1 WHERE net=? AND pool=? AND grp=?", (k, net, pool, grp))
                 else:
                     db.execute("UPDATE entries SET next_snap=?, snap_idx=? WHERE net=? AND pool=? AND grp=?",
-                               (ets + CONTROL_SNAP_HOURS[k] * 3600, k, net, pool, grp))
+                               (ets + sched[k] * 3600, k, net, pool, grp))
     db.commit()
     if rows:
         log.info("snapshot: %d건", len(rows))

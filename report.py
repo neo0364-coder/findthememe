@@ -271,6 +271,75 @@ def build_report(c):
                          else ("표본 수집 중" if not s1 else "기준 미달 — 폐기")))
     L.append("")
 
+    # ── v9 생존자 확장: 하드필터 통과 토큰 전체 (가이드 체인필터와 무관) ──
+    SV = [e for e in E if e["grp"] == "surv"]
+    ps2 = c.execute("SELECT v FROM meta WHERE k='surv2_criteria_at'").fetchone()
+    L.append(f"[생존자 확장 — 하드필터 통과 토큰 전체, 첫 통과 후 12h 생존 시 진입 / 추적 {len(SV)}개 / 기준 고정 "
+             f"{kst(float(ps2[0])) if ps2 else '-'}]")
+
+    def snap_at(e, h, tol_after=3600):
+        t = e["ts"] + h * 3600
+        return next((s for s in e["snaps"] if t - 450 <= s[0] <= t + tol_after), None)
+
+    def dead(s, p0, l0):
+        return s is None or s[5] or s[1] is None or s[1] <= p0 * 0.2 or (l0 and s[2] is not None and s[2] <= l0 * 0.2)
+
+    reached = survived = 0
+    rows_sv = []
+    for e in SV:
+        s12 = snap_at(e, 12)
+        if not s12 and e["ts"] + 13 * 3600 > time.time():
+            continue                       # 아직 12h 안 됨
+        reached += 1
+        early = [snap_at(e, h) for h in (3, 6)]
+        if any(s is not None and dead(s, e["price"], e["liq"]) for s in early) or dead(s12, e["price"], e["liq"]):
+            continue
+        survived += 1
+        act = (s12[3] or 0) >= ZOMBIE_VOL
+        out = {"net": e["net"], "active": act}
+        for hold, h_out in ((6, 18), (12, 24)):
+            so = snap_at(e, h_out)
+            if so is None:
+                if e["ts"] + (h_out + 1) * 3600 > time.time():
+                    continue
+                out[hold] = (-1.0, True)
+            elif so[5] or so[1] is None:
+                out[hold] = (-1.0, True)
+            else:
+                r_ = so[1] / s12[1] - 1
+                out[hold] = (r_, r_ <= -0.8 or (s12[2] and so[2] is not None and so[2] <= s12[2] * 0.2))
+        rows_sv.append(out)
+    n_act = sum(1 for o in rows_sv if o["active"])
+    L.append(f" 12h 도달 {reached}개 → 생존 {survived}개 ({survived/reached:.0%} ) → 활성 {n_act}개" if reached else " 12h 도달 표본 없음")
+
+    def fmt2(lst, hold):
+        rs = [o[hold] for o in lst if hold in o]
+        vals, bad = clean([r[0] - COST for r in rs])
+        if not vals:
+            return "표본 없음", None
+        ci = boot_ci(vals)
+        rer = sum(1 for r in rs if r[1])
+        return (f"n={len(vals):3d} 중앙 {st.median(vals):+6.1%} 평균 {st.mean(vals):+6.1%} 승률 {sum(v > 0 for v in vals)/len(vals):3.0%}"
+                + (f" CI[{ci[0]:+.1%},{ci[1]:+.1%}]" if ci else "") + f" 재러그 {rer}({rer/len(rs):.0%})"
+                + (f" [의심값 {bad}건 제외]" if bad else "")), {"n": len(vals), "med": st.median(vals), "ci": ci, "rer": rer / len(rs)}
+
+    for hold in (6, 12):
+        L.append(f" 활성·{hold:2d}h 보유: {fmt2([o for o in rows_sv if o['active']], hold)[0]}")
+        L.append(f" 좀비·{hold:2d}h 보유: {fmt2([o for o in rows_sv if not o['active']], hold)[0]}")
+    for net in sorted({o["net"] for o in rows_sv}):
+        L.append(f"   {net:10s} 활성·6h: {fmt2([o for o in rows_sv if o['active'] and o['net'] == net], 6)[0]}")
+    _, sv2 = fmt2([o for o in rows_sv if o["active"]], 6)
+    t1 = bool(sv2) and sv2["n"] >= 30
+    t2 = bool(sv2) and sv2["med"] > 0
+    t3 = bool(sv2) and sv2["ci"] is not None and sv2["ci"][0] > 0
+    t4 = bool(sv2) and sv2["rer"] < 0.10
+    L.append("   T1 표본≥30  T2 순수익 중앙값>0  T3 평균 95%CI 하한>0  T4 재러그<10%  (대상: 활성·6h 보유)")
+    L.append("   " + "  ".join(f"{k}: {'PASS' if v else ('FAIL' if t1 else '보류')}"
+                              for k, v in (("T1", t1), ("T2", t2), ("T3", t3), ("T4", t4)))
+             + "  → " + ("전부 PASS — 소액 실전 설계 검토" if all((t1, t2, t3, t4))
+                         else ("표본 수집 중" if not t1 else "기준 미달 — 폐기")))
+    L.append("")
+
     sims = {}
     for gname in ("pass (가이드 필터 통과)", "pass2 (수정 규칙: 빈값=탈락, 풀계정 제외)"):
         P = groups[gname]
