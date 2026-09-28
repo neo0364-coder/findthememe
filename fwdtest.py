@@ -21,16 +21,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
-VERSION = "v7-sol-holders (2026-09-27)"   # 배포 확인용: 시작 로그·리포트 첫 줄에 표시
+VERSION = "v8-survivor (2026-09-28)"   # 배포 확인용: 시작 로그·리포트 첫 줄에 표시
 
 # ───────────────────────── 설정 ─────────────────────────
 DB_PATH = os.environ.get("DB_PATH", "/data/memefwd.db")
-NETWORKS = [n.strip() for n in os.environ.get("NETWORKS", "solana,bsc,robinhood").split(",") if n.strip()]
-DISCOVERY_PAGES = int(os.environ.get("DISCOVERY_PAGES", "1"))           # 429 부담 줄이려 2→1 (체인당 최신 20개)
+NETWORKS = [n.strip() for n in os.environ.get("NETWORKS", "solana,robinhood").split(",") if n.strip()]   # v8: BSC 신규 수집 중단(6h 중앙 -100%)
+DISCOVERY_PAGES = int(os.environ.get("DISCOVERY_PAGES", "2"))           # v8: BSC 뺀 여유분으로 다시 2 (체인당 최신 40개)
 DISCOVERY_EVERY_SEC = int(os.environ.get("DISCOVERY_EVERY_SEC", "900"))   # 가이드와 동일: 15분
 GT_RPM = float(os.environ.get("GT_RPM", "6"))                             # GeckoTerminal 무료 한도 — 9에서 429가 잦아 6으로 낮춤
 CONTROL_SAMPLE = float(os.environ.get("CONTROL_SAMPLE", "0.35"))          # 대조군 추적 비율 (API 예산용)
-PASS_SNAP_HOURS = 24
+PASS_SNAP_HOURS = 30                                                      # 12h 대기+12h 보유 분석용으로 24→30
 CONTROL_SNAP_HOURS = [1, 6, 24]
 CHECK_AGES_MIN = [20, 45, 90, 180, 360, 720, 1440, 2880, 4320]            # 재평가 시점(상장 후 분)
 PORT = int(os.environ.get("PORT", "8080"))
@@ -194,6 +194,7 @@ def db_connect():
         c.execute("ALTER TABLE pools ADD COLUMN v2_done INTEGER DEFAULT 0")
         c.execute("UPDATE pools SET guide_done=1, v2_done=1 WHERE done=1")
     c.execute("INSERT OR IGNORE INTO meta VALUES('pass2_started_at', ?)", (str(time.time()),))
+    c.execute("INSERT OR IGNORE INTO meta VALUES('survivor_criteria_at', ?)", (str(time.time()),))   # 생존자 기준 고정 시각
     c.execute("INSERT OR IGNORE INTO meta VALUES('started_at', ?)", (str(time.time()),))
     c.commit()
     return c
@@ -646,7 +647,8 @@ def next_idx_after(age_min):
 def evaluate_due(db, max_pools=300):
     """pass(가이드 원본 규칙)와 pass2(수정 규칙)를 같은 평가 시점·같은 데이터로 동시에 판정."""
     now = time.time()
-    rows = db.execute("SELECT net,pool,token,created_at,next_idx,has_control,guide_done,v2_done FROM pools WHERE done=0").fetchall()
+    rows = [r for r in db.execute("SELECT net,pool,token,created_at,next_idx,has_control,guide_done,v2_done FROM pools WHERE done=0")
+            if r[0] in NETWORKS]          # 수집 중단한 체인은 신규 평가 안 함 (이미 진입한 건의 가격 추적은 계속)
     for r in rows:
         if r[4] >= len(CHECK_AGES_MIN) or (now - r[3]) > HARD["max_age_hours"] * 3600 + 3600:
             db.execute("UPDATE pools SET done=1 WHERE net=? AND pool=?", (r[0], r[1]))

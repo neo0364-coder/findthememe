@@ -91,10 +91,10 @@ def exit_sim(e, stop=None):
     return last[1] / e["price"] - 1, last[0]
 
 
-def rug_time(e):
+def rug_time(e, upto_h=24):
     """15분 스냅 기준 러그(-80% / 유동성 -80% / 풀 소멸) 첫 발생까지 걸린 시간(시간). 없으면 None."""
     for s in e["snaps"]:
-        if s[0] > e["ts"] + 24 * 3600 + 900:
+        if s[0] > e["ts"] + upto_h * 3600 + 900:
             break
         if s[5] or s[1] is None or s[1] <= e["price"] * 0.2 or (e["liq"] and s[2] is not None and s[2] <= e["liq"] * 0.2):
             return (s[0] - e["ts"]) / 3600
@@ -103,21 +103,21 @@ def rug_time(e):
 
 def delayed_entry(e, wait_h, hold_h):
     """'살아남은 뒤 진입': 통과 후 wait_h 시간 기다렸다가, 그때까지 러그가 없으면 그 가격에 진입해 hold_h 보유.
-    반환: ('avoided'|'entered'|None, 수익률)"""
+    반환 dict: status('avoided'|'entered'|None), ret, vol_h6_in, liq_in, rerug(보유 중 러그 여부)"""
     t_in = e["ts"] + wait_h * 3600
-    rt = rug_time(e)
+    rt = rug_time(e, upto_h=wait_h + hold_h)
     if rt is not None and rt <= wait_h:
-        return "avoided", None
+        return {"status": "avoided"}
     s_in = next((s for s in e["snaps"] if t_in - 450 <= s[0] <= t_in + 1800), None)
     if not s_in or s_in[1] is None:
-        return None, None
+        return {"status": None}
     t_out = s_in[0] + hold_h * 3600
     s_out = next((s for s in e["snaps"] if t_out - 450 <= s[0] <= t_out + 1800), None)
     if not s_out:
-        return None, None
-    if s_out[5] or s_out[1] is None:
-        return "entered", -1.0
-    return "entered", s_out[1] / s_in[1] - 1
+        return {"status": None}
+    ret = -1.0 if (s_out[5] or s_out[1] is None) else s_out[1] / s_in[1] - 1
+    return {"status": "entered", "ret": ret, "vol_h6_in": s_in[3], "liq_in": s_in[2],
+            "rerug": rt is not None and rt > wait_h}
 
 
 def boot_ci(xs, fn=st.mean, n=2000):
@@ -128,14 +128,25 @@ def boot_ci(xs, fn=st.mean, n=2000):
     return vals[int(0.025 * n)], vals[int(0.975 * n)]
 
 
+SUSPECT = float(os.environ.get("SUSPECT_RET", "10.0"))   # 한 구간 +1000% 초과 = 가격 데이터 의심(죽은 풀 가격 튐)
+
+
+def clean(xs):
+    """데이터 의심값(+1000% 초과) 제외. (남은 값, 제외 건수)"""
+    kept = [x for x in xs if x <= SUSPECT]
+    return kept, len(xs) - len(kept)
+
+
 def summ(xs):
+    xs, bad = clean(xs)
     if not xs:
-        return "n=0"
+        return "n=0" + (f" (의심값 {bad}건 제외)" if bad else "")
     net = [x - COST for x in xs]
     ci = boot_ci(net)
     ci_s = f"  평균95%CI[{ci[0]:+.1%},{ci[1]:+.1%}]" if ci else ""
     return (f"n={len(xs):4d}  중앙 {st.median(xs):+7.1%}  평균 {st.mean(xs):+7.1%}  "
-            f"순수익>0 비율 {sum(1 for x in net if x > 0) / len(net):5.1%}{ci_s}")
+            f"순수익>0 비율 {sum(1 for x in net if x > 0) / len(net):5.1%}{ci_s}"
+            + (f"  [의심값 {bad}건 제외]" if bad else ""))
 
 
 def build_report(c):
@@ -198,28 +209,66 @@ def build_report(c):
     L.append("")
 
     # 러그 속도 + 살아남은 뒤 진입
-    L.append("[러그는 얼마나 빨리 오나 — pass+pass2, 15분 스냅 기준]")
-    PP = [e for e in E if e["grp"] in ("pass", "pass2")]
+    # pass·pass2가 같은 토큰을 중복으로 갖는 경우가 많아 풀 기준으로 1건만 (먼저 통과한 쪽)
+    first = {}
+    for e in sorted([e for e in E if e["grp"] in ("pass", "pass2")], key=lambda e: e["ts"]):
+        first.setdefault((e["net"], e["pool"]), e)
+    PP = list(first.values())
+    L.append(f"[러그는 얼마나 빨리 오나 — pass∪pass2 고유 토큰 {len(PP)}개, 15분 스냅 기준]")
     rts = [t for t in (rug_time(e) for e in PP) if t is not None]
-    done = [e for e in PP if e["snaps"] and e["snaps"][-1][0] >= e["ts"] + 6 * 3600]
     if rts:
         L.append(f" 러그 {len(rts)}건 — 걸린 시간 중앙값 {st.median(rts):.1f}h, "
                  f"1h 이내 {sum(t <= 1 for t in rts)/len(rts):.0%}, 3h 이내 {sum(t <= 3 for t in rts)/len(rts):.0%}, "
-                 f"6h 이내 {sum(t <= 6 for t in rts)/len(rts):.0%}")
+                 f"6h 이내 {sum(t <= 6 for t in rts)/len(rts):.0%}, 12h 이내 {sum(t <= 12 for t in rts)/len(rts):.0%}")
     else:
         L.append(" 러그 표본 없음")
-    L.append("[살아남은 뒤 진입 시뮬레이션 — 통과 후 N시간 기다려 러그 안 났으면 그때 진입, 6h 보유, 비용 차감]")
-    for wait in (1, 2, 3, 6, 12):
-        outs = [delayed_entry(e, wait, 6) for e in PP]
-        av = sum(1 for o in outs if o[0] == "avoided")
-        rs = [o[1] - COST for o in outs if o[0] == "entered"]
-        if rs:
-            ci = boot_ci(rs)
-            L.append(f" {wait}h 대기: 러그 회피 {av}건, 진입 {len(rs)}건 → 중앙 {st.median(rs):+.1%} 평균 {st.mean(rs):+.1%} "
-                     f"승률 {sum(1 for x in rs if x > 0)/len(rs):.0%}" + (f" 95%CI[{ci[0]:+.1%},{ci[1]:+.1%}]" if ci else "")
-                     + f" / 진입 후 다시 러그 {sum(1 for x in rs if x <= -0.8 - COST)}건")
-        else:
-            L.append(f" {wait}h 대기: 러그 회피 {av}건, 진입 표본 없음 (아직 {wait + 6}h 경과 안 됨)")
+
+    def fmt_sv(outs):
+        av = sum(1 for o in outs if o["status"] == "avoided")
+        en = [o for o in outs if o["status"] == "entered"]
+        rs, bad = clean([o["ret"] - COST for o in en])
+        if not rs:
+            return f"러그 회피 {av}건, 진입 표본 없음", None
+        ci = boot_ci(rs)
+        rer = sum(1 for o in en if o["rerug"])
+        txt = (f"회피 {av:3d} 진입 {len(rs):3d} → 중앙 {st.median(rs):+6.1%} 평균 {st.mean(rs):+6.1%} "
+               f"승률 {sum(1 for x in rs if x > 0)/len(rs):3.0%}" + (f" CI[{ci[0]:+.1%},{ci[1]:+.1%}]" if ci else "")
+               + f" 재러그 {rer}건({rer/len(en):.0%})" + (f" [의심값 {bad}건 제외]" if bad else ""))
+        return txt, {"n": len(rs), "med": st.median(rs), "ci": ci, "rerug": rer / len(en) if en else None}
+
+    L.append("[살아남은 뒤 진입 시뮬레이션 — 통과 후 N시간 러그 없으면 그때 진입, 비용 차감]")
+    for wait in (1, 3, 6, 12):
+        for hold in (6, 12):
+            if wait + hold > 24:
+                continue
+            txt, _ = fmt_sv([delayed_entry(e, wait, hold) for e in PP])
+            L.append(f" {wait:2d}h 대기·{hold:2d}h 보유: {txt}")
+    L.append("")
+
+    # 생존자 전략 (12h 대기) 상세 — 좀비(거래 없는 토큰) 제외 · 체인별
+    ZOMBIE_VOL = float(os.environ.get("ZOMBIE_VOL_H6", "5000"))
+    L.append(f"[생존자 전략 상세 — 12h 대기·6h 보유 / 활성 = 진입 시점 6h 거래량 ≥ ${ZOMBIE_VOL:,.0f}]")
+    outs12 = [(e, delayed_entry(e, 12, 6)) for e in PP]
+    active = [(e, o) for e, o in outs12 if o["status"] == "entered" and (o["vol_h6_in"] or 0) >= ZOMBIE_VOL]
+    zombie = [(e, o) for e, o in outs12 if o["status"] == "entered" and (o["vol_h6_in"] or 0) < ZOMBIE_VOL]
+    for lab, grp in (("활성", active), ("좀비(거래 부족)", zombie)):
+        txt, _ = fmt_sv([o for _, o in grp])
+        L.append(f" {lab:12s}: {txt}")
+    for net in sorted({e["net"] for e in PP}):
+        txt, _ = fmt_sv([o for e, o in active if e["net"] == net])
+        L.append(f"   {net:10s} 활성: {txt}")
+    _, sv = fmt_sv([o for _, o in active])
+    ps = c.execute("SELECT v FROM meta WHERE k='survivor_criteria_at'").fetchone()
+    L.append(f" ▶ 생존자 전략 사전 기준 (고정 {kst(float(ps[0])) if ps else '-'}) — 대상: 활성 토큰")
+    s1 = bool(sv) and sv["n"] >= 30
+    s2 = bool(sv) and sv["med"] > 0
+    s3 = bool(sv) and sv["ci"] is not None and sv["ci"][0] > 0
+    s4 = bool(sv) and sv["rerug"] is not None and sv["rerug"] < 0.10
+    L.append("   S1 표본≥30  S2 순수익 중앙값>0  S3 평균 95%CI 하한>0  S4 진입 후 재러그<10%")
+    L.append("   " + "  ".join(f"{k}: {'PASS' if v else ('FAIL' if s1 else '보류')}"
+                              for k, v in (("S1", s1), ("S2", s2), ("S3", s3), ("S4", s4)))
+             + "  → " + ("전부 PASS — 소액 실전 설계 검토" if all((s1, s2, s3, s4))
+                         else ("표본 수집 중" if not s1 else "기준 미달 — 폐기")))
     L.append("")
 
     sims = {}
