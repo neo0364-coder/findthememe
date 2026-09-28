@@ -296,7 +296,13 @@ def build_report(c):
             continue
         survived += 1
         act = (s12[3] or 0) >= ZOMBIE_VOL
-        out = {"net": e["net"], "active": act}
+        lows = [s[1] for s in early + [s12] if s is not None and s[1]]
+        out = {"net": e["net"], "active": act, "f": {
+            "생존 중 가격변화(12h/첫기록)": s12[1] / e["price"] - 1,                       # 올라서 살아남음 vs 빠져서 살아남음
+            "생존 중 최저점(최저/첫기록)": (min(lows) / e["price"]) if lows else None,       # 한 번 크게 빠졌다 회복했나
+            "유동성 유지율(12h/첫기록)": (s12[2] / e["liq"]) if (s12[2] and e["liq"]) else None,
+            "회전율(6h거래/유동성)": (s12[3] / s12[2]) if (s12[3] and s12[2]) else None,
+        }}
         for hold, h_out in ((6, 18), (12, 24)):
             so = snap_at(e, h_out)
             if so is None:
@@ -328,6 +334,22 @@ def build_report(c):
         L.append(f" 좀비·{hold:2d}h 보유: {fmt2([o for o in rows_sv if not o['active']], hold)[0]}")
     for net in sorted({o["net"] for o in rows_sv}):
         L.append(f"   {net:10s} 활성·6h: {fmt2([o for o in rows_sv if o['active'] and o['net'] == net], 6)[0]}")
+    # 진입 조건 탐색: 생존 시점(12h)에 보이는 값으로 이후 6h 수익이 갈리는지 (중앙값 기준 위/아래)
+    act_rows = [o for o in rows_sv if o["active"] and 6 in o]
+    L.append(f" [진입 조건 탐색 — 활성 생존자 {len(act_rows)}건, 이후 6h 순수익 / ※ 탐색용, 판정에 사용 안 함]")
+    if len(act_rows) >= 10:
+        for fname in act_rows[0]["f"]:
+            vals = [(o["f"][fname], o[6][0] - COST) for o in act_rows if o["f"].get(fname) is not None]
+            if len(vals) < 10:
+                continue
+            cut = st.median(v for v, _ in vals)
+            for side, sel in (("낮음", [r_ for v, r_ in vals if v <= cut]), ("높음", [r_ for v, r_ in vals if v > cut])):
+                sel, _ = clean(sel)
+                if sel:
+                    L.append(f"   {fname:24s} {side}(기준 {cut:+.2f}) n={len(sel):3d} 중앙 {st.median(sel):+6.1%} "
+                             f"평균 {st.mean(sel):+6.1%} 승률 {sum(x > 0 for x in sel)/len(sel):3.0%}")
+    else:
+        L.append("   활성 생존자 10건 미만 — 아직 나눠 볼 수 없음")
     _, sv2 = fmt2([o for o in rows_sv if o["active"]], 6)
     t1 = bool(sv2) and sv2["n"] >= 30
     t2 = bool(sv2) and sv2["med"] > 0
@@ -405,6 +427,32 @@ def build_report(c):
         L.append(f" {lab:22s} 러그 " + (f"{sum(fl)/len(fl):5.1%} ({sum(fl)}/{len(fl)})" if fl else "  -  "))
     gp_ok = sum(1 for _, d in lp_rows if d.get("gp_supported"))
     L.append(f" (GoPlus 지원 확인 {gp_ok}/{len(lp_rows)}건, V2 LP {sum(1 for _, d in lp_rows if d.get('lp_v2'))}건)")
+    L.append("")
+
+    # ── 현재 생존·수익 중 토큰 (마지막 스냅 기준) ──
+    now_ts = time.time()
+    best = {}
+    for e in E:
+        if e["grp"] not in ("pass", "pass2", "surv") or not e["snaps"] or not e["price"]:
+            continue
+        last = e["snaps"][-1]
+        if now_ts - last[0] > 2 * 3600 or last[5] or last[1] is None:
+            continue                                   # 2시간 넘게 확인 안 됐거나 풀 소멸
+        if rug_time(e, upto_h=48) is not None:
+            continue                                   # 한 번이라도 러그 기준에 걸린 토큰 제외
+        ret = last[1] / e["price"] - 1
+        if ret <= 0 or ret > SUSPECT:
+            continue
+        key = (e["net"], e["pool"])
+        if key not in best or e["ts"] < best[key][0]["ts"]:
+            best[key] = (e, last, ret)
+    L.append(f"[현재 생존·수익 중 — 최근 2h 내 확인, 러그 이력 없음, 첫 기록가 대비 플러스 / {len(best)}개]")
+    L.append(" ※ 매수 신호 아님: 생존자 전략(T1~T4)은 아직 검증 전. 과거 수익이 이후 수익을 뜻하지 않음")
+    for e, last, ret in sorted(best.values(), key=lambda x: -x[2])[:30]:
+        age_h = (now_ts - e["ts"]) / 3600
+        act = "활성" if (last[3] or 0) >= float(os.environ.get("ZOMBIE_VOL_H6", "5000")) else "좀비"
+        L.append(f" {e['net']:9s} {ret:+7.1%}  기록후 {age_h:4.1f}h  유동성 ${(last[2] or 0):>9,.0f}  6h거래 ${(last[3] or 0):>9,.0f} {act}"
+                 f"  CA={e['token']}")
     L.append("")
 
     L.append("[최근 pass / pass2 20건 — CA는 토큰 주소, pool은 LP(풀) 주소]")
