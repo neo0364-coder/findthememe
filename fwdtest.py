@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
-VERSION = "v9.3-stale-death (2026-09-28)"   # 배포 확인용: 시작 로그·리포트 첫 줄에 표시
+VERSION = "v9.4-flow-at-entry (2026-09-28)"   # 배포 확인용: 시작 로그·리포트 첫 줄에 표시
 
 # ───────────────────────── 설정 ─────────────────────────
 DB_PATH = os.environ.get("DB_PATH", "/data/memefwd.db")
@@ -172,6 +172,7 @@ CREATE TABLE IF NOT EXISTS snaps(
 CREATE INDEX IF NOT EXISTS ix_snaps ON snaps(net, pool, grp, ts);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS net_errors(ts REAL, net TEXT, msg TEXT);
+CREATE TABLE IF NOT EXISTS flow_snaps(net TEXT, pool TEXT, mark INTEGER, ts REAL, flow TEXT, PRIMARY KEY(net, pool, mark));
 CREATE TABLE IF NOT EXISTS regime(ts REAL, net TEXT, n_pools INTEGER, span_min REAL, launches_per_hour REAL,
   med_vol_h1 REAL, med_chg_h1 REAL);
 """
@@ -730,6 +731,11 @@ def snapshot_due(db):
             db.execute("INSERT INTO snaps VALUES(?,?,?,?,?,?,?,?,?)",
                        (net, pool, grp, now, m["price"] if m else None, m["liq"] if m else None,
                         m["vol_h6"] if m else None, m["vol_h24"] if m else None, 0 if m else 1))
+            # v9.4: 12h(=생존자 진입 시점)에 체결 내역으로 '진짜 사람 거래'인지 기록 (토큰당 1회)
+            if m and now - ets >= 12 * 3600 - 900 and grp in ("pass", "pass2", "surv"):
+                if not db.execute("SELECT 1 FROM flow_snaps WHERE net=? AND pool=? AND mark=12", (net, pool)).fetchone():
+                    fl = trade_flow(net, pool)
+                    db.execute("INSERT OR IGNORE INTO flow_snaps VALUES(?,?,?,?,?)", (net, pool, 12, now, json.dumps(fl)))
             if grp in ("pass", "pass2"):
                 nxt = now + 900
                 closed = int(nxt > ets + PASS_SNAP_HOURS * 3600 + 600)

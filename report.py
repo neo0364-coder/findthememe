@@ -72,6 +72,20 @@ def exit_value(e, s, base_price):
     return s[1] / base_price - 1
 
 
+REAL_MIN_WALLETS = 100      # v9.4 고정: 최근 체결(최대 300건) 고유 지갑 수 하한
+REAL_MAX_TPW = 3.0          # 지갑당 거래 수 상한
+REAL_MAX_TOP5 = 0.5         # 상위 5지갑 거래량 비중 상한
+
+
+def flow_class(fl):
+    """12h 시점 체결 구조로 '진짜 활성' / '가짜 활성'(자전거래·볼륨봇) / '미확인'."""
+    if not fl or not fl.get("tr_n") or fl.get("tr_n", 0) < 10 or fl.get("tr_uniq_wallets") is None:
+        return "미확인"
+    ok = (fl["tr_uniq_wallets"] >= REAL_MIN_WALLETS and (fl.get("tr_trades_per_wallet") or 99) <= REAL_MAX_TPW
+          and (fl.get("tr_top5_vol_share") or 1) <= REAL_MAX_TOP5)
+    return "진짜" if ok else "가짜"
+
+
 def at_horizon(e, h):
     """entry 후 h시간 시점 스냅(허용오차 -7.5분~+30분)."""
     target = e["ts"] + h * 3600
@@ -172,6 +186,10 @@ def summ(xs):
 
 def build_report(c):
     E = load(c)
+    try:
+        FLOW = {(n, p): json.loads(fl) for n, p, fl in c.execute("SELECT net,pool,flow FROM flow_snaps WHERE mark=12")}
+    except sqlite3.OperationalError:
+        FLOW = {}
     started = float((c.execute("SELECT v FROM meta WHERE k='started_at'").fetchone() or [time.time()])[0])
     L = []
     try:
@@ -272,6 +290,10 @@ def build_report(c):
     outs12 = [(e, delayed_entry(e, 12, 6)) for e in PP]
     active = [(e, o) for e, o in outs12 if o["status"] == "entered" and (o["vol_h6_in"] or 0) >= ZOMBIE_VOL]
     zombie = [(e, o) for e, o in outs12 if o["status"] == "entered" and (o["vol_h6_in"] or 0) < ZOMBIE_VOL]
+    for cls in ("진짜", "가짜", "미확인"):
+        sub = [(e, o) for e, o in active if flow_class(FLOW.get((e["net"], e["pool"]))) == cls]
+        txt, _ = fmt_sv([o for _, o in sub])
+        L.append(f"   활성 중 {cls} 거래: {txt}")
     for lab, grp in (("활성", active), ("좀비(거래 부족)", zombie)):
         txt, _ = fmt_sv([o for _, o in grp])
         L.append(f" {lab:12s}: {txt}")
@@ -295,6 +317,7 @@ def build_report(c):
     # ── v9 생존자 확장: 하드필터 통과 토큰 전체 (가이드 체인필터와 무관) ──
     SV = [e for e in E if e["grp"] == "surv"]
     ps2 = c.execute("SELECT v FROM meta WHERE k='surv2_criteria_at'").fetchone()
+    L.append(f"(진짜 거래 기준 v9.4 고정: 최근 체결 고유지갑 ≥{REAL_MIN_WALLETS}, 지갑당 거래 ≤{REAL_MAX_TPW:g}, 상위5 거래비중 ≤{REAL_MAX_TOP5:.0%})")
     L.append(f"[생존자 확장 — 하드필터 통과 토큰 전체, 첫 통과 후 12h 생존 시 진입 / 추적 {len(SV)}개 / 기준 고정 "
              f"{kst(float(ps2[0])) if ps2 else '-'}]")
 
@@ -323,7 +346,16 @@ def build_report(c):
             "생존 중 최저점(최저/첫기록)": (min(lows) / e["price"]) if lows else None,       # 한 번 크게 빠졌다 회복했나
             "유동성 유지율(12h/첫기록)": (s12[2] / e["liq"]) if (s12[2] and e["liq"]) else None,
             "회전율(6h거래/유동성)": (s12[3] / s12[2]) if (s12[3] and s12[2]) else None,
+            # 가격 효과를 뺀 실제 LP 증감: (유동성 배율)/√(가격 배율). >1 = 누군가 LP 추가, <1 = 빼감
+            "순유동성 증가(가격효과 제거)": ((s12[2] / e["liq"]) / ((s12[1] / e["price"]) ** 0.5))
+                                    if (s12[2] and e["liq"] and s12[1] and e["price"]) else None,
         }}
+        fl = FLOW.get((e["net"], e["pool"]))
+        out["flow"] = flow_class(fl)
+        if fl:
+            for k in ("tr_uniq_wallets", "tr_trades_per_wallet", "tr_top5_vol_share", "tr_roundtrip_wallet_share"):
+                if fl.get(k) is not None:
+                    out["f"]["[12h체결] " + k] = fl[k]
         for hold, h_out in ((6, 18), (12, 24)):
             so = snap_at(e, h_out)
             if so is None:
@@ -352,6 +384,8 @@ def build_report(c):
     for hold in (6, 12):
         L.append(f" 활성·{hold:2d}h 보유: {fmt2([o for o in rows_sv if o['active']], hold)[0]}")
         L.append(f" 좀비·{hold:2d}h 보유: {fmt2([o for o in rows_sv if not o['active']], hold)[0]}")
+    for cls in ("진짜", "가짜", "미확인"):
+        L.append(f"   활성 중 {cls} 거래·6h: {fmt2([o for o in rows_sv if o['active'] and o.get('flow') == cls], 6)[0]}")
     for net in sorted({o["net"] for o in rows_sv}):
         L.append(f"   {net:10s} 활성·6h: {fmt2([o for o in rows_sv if o['active'] and o['net'] == net], 6)[0]}")
     # 진입 조건 탐색: 생존 시점(12h)에 보이는 값으로 이후 6h 수익이 갈리는지 (중앙값 기준 위/아래)
